@@ -24,6 +24,24 @@ class OpenVikingConfig(BaseModel):
     isolate_user_scope_by_agent: bool = Field(default=False)
     isolate_agent_scope_by_user: bool = Field(default=True)
 
+    # --- capture & recall toggles ---
+    auto_capture: bool = Field(default=True)
+    auto_recall: bool = Field(default=True)
+
+    # --- capture behaviour ---
+    capture_mode: str = Field(default="semantic")  # "semantic" or "keyword"
+    capture_max_length: int = Field(default=8192)
+
+    # --- session bypass patterns (comma-separated globs) ---
+    bypass_session_patterns: str = Field(default="")
+
+    # --- recall behaviour ---
+    recall_token_budget: int = Field(default=2000)
+    recall_resources: bool = Field(default=False)
+
+    # --- diagnostics ---
+    emit_diagnostics: bool = Field(default=True)
+
     @classmethod
     def from_env(cls) -> "OpenVikingConfig":
         """Load configuration from .env file."""
@@ -47,6 +65,37 @@ class OpenVikingConfig(BaseModel):
             == "true",
             isolate_agent_scope_by_user=os.getenv(
                 "OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER", "true"
+            ).lower()
+            == "true",
+            # capture & recall toggles
+            auto_capture=os.getenv(
+                "OPENVIKING_AUTO_CAPTURE", "true"
+            ).lower()
+            == "true",
+            auto_recall=os.getenv(
+                "OPENVIKING_AUTO_RECALL", "true"
+            ).lower()
+            == "true",
+            # capture behaviour
+            capture_mode=os.getenv("OPENVIKING_CAPTURE_MODE", "semantic"),
+            capture_max_length=int(
+                os.getenv("OPENVIKING_CAPTURE_MAX_LENGTH", "8192")
+            ),
+            # bypass patterns
+            bypass_session_patterns=os.getenv(
+                "OPENVIKING_BYPASS_SESSION_PATTERNS", ""
+            ),
+            # recall behaviour
+            recall_token_budget=int(
+                os.getenv("OPENVIKING_RECALL_TOKEN_BUDGET", "2000")
+            ),
+            recall_resources=os.getenv(
+                "OPENVIKING_RECALL_RESOURCES", "false"
+            ).lower()
+            == "true",
+            # diagnostics
+            emit_diagnostics=os.getenv(
+                "OPENVIKING_EMIT_DIAGNOSTICS", "true"
             ).lower()
             == "true",
         )

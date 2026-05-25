@@ -4,7 +4,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from engine.bypass import compile_session_patterns, should_bypass_session
 from engine.config import OpenVikingConfig
+from engine.diagnostics import emit_diag
 from engine.memory import MemoryEngine
 from engine.memory_ranking import (
     apply_score_threshold,
@@ -13,10 +15,14 @@ from engine.memory_ranking import (
     filter_leaf_memories,
     rerank_memories,
 )
+from engine.agent_resolver import AgentResolver
 from engine.openviking_client import OpenVikingClient
+from engine.session_utils import session_to_ov_id
 from engine.text_utils import (
     extract_latest_user_text,
+    get_capture_decision,
     message_to_ov_parts,
+    prepare_recall_query,
     sanitize_user_text_for_capture,
 )
 
@@ -35,6 +41,19 @@ class OpenVikingMemoryEngine(MemoryEngine):
     ) -> None:
         self.config = config
         self.client = client
+        self._agent_resolver = AgentResolver(config.agent_id)
+        self._bypass_patterns = compile_session_patterns(
+            [p.strip() for p in config.bypass_session_patterns.split(",") if p.strip()]
+        )
+
+    def _diag(
+        self, stage: str, session_id: str, data: dict
+    ) -> None:
+        emit_diag(stage, session_id, data, self.config.emit_diagnostics)
+
+    def _resolve_agent_id(self, session_id: str) -> str:
+        """Resolve agent ID from sessionId or fall back to config."""
+        return self._agent_resolver.resolve(session_id)
 
     async def generate_memory(
         self, session_id: str, messages: list[dict]
@@ -50,18 +69,57 @@ class OpenVikingMemoryEngine(MemoryEngine):
         """
         import time
 
+        ov_session_id = session_to_ov_id(session_id)
+
+        self._diag(
+            "generate_memory_entry",
+            ov_session_id,
+            {
+                "sessionId": session_id,
+                "ovSessionId": ov_session_id,
+                "msg_count": len(messages),
+                "auto_capture": self.config.auto_capture,
+                "auto_recall": self.config.auto_recall,
+            },
+        )
+
+        # Bypass check
+        if should_bypass_session(session_id, self._bypass_patterns):
+            logger.info(
+                "[generate_memory] session bypassed sessionId=%s", session_id
+            )
+            self._diag(
+                "generate_memory_skip",
+                ov_session_id,
+                {"reason": "session_bypassed", "sessionId": session_id},
+            )
+            return ""
+
         start = time.monotonic()
-        logger.info("[generate_memory] start sessionId=%s msg_count=%s", session_id, len(messages))
+        logger.info(
+            "[generate_memory] start sessionId=%s ovSessionId=%s msg_count=%s",
+            session_id,
+            ov_session_id,
+            len(messages),
+        )
 
         # 1. Capture messages
         capture_start = time.monotonic()
-        await self._capture_messages(session_id, messages)
-        logger.info("[generate_memory] capture done in %.3fs", time.monotonic() - capture_start)
+        if self.config.auto_capture:
+            await self._capture_messages(session_id, ov_session_id, messages)
+        else:
+            logger.info(
+                "[generate_memory] auto_capture disabled, skipping capture"
+            )
+        logger.info(
+            "[generate_memory] capture done in %.3fs", time.monotonic() - capture_start
+        )
 
         # 2. Get session context
         ctx_start = time.monotonic()
+        context = {}
         try:
-            context = await self.client.get_session_context(session_id)
+            context = await self.client.get_session_context(ov_session_id)
             overview = context.get("latest_archive_overview", "")[:50]
             abstracts_count = len(context.get("pre_archive_abstracts", []))
             logger.info(
@@ -72,43 +130,73 @@ class OpenVikingMemoryEngine(MemoryEngine):
             )
         except Exception as e:
             logger.warning(
-                "[generate_memory] failed to get session context for %s: %s", session_id, e
+                "[generate_memory] failed to get session context for %s: %s",
+                ov_session_id,
+                e,
             )
-            context = {}
 
-        # 3. Search relevant memories
-        recall_start = time.monotonic()
-        query_text = extract_latest_user_text(messages)
-        logger.info("[generate_memory] recall query='%s'", query_text[:100])
-        memories = await self._recall_memories(query_text)
-        logger.info(
-            "[generate_memory] recall done in %.3fs, memories=%s",
-            time.monotonic() - recall_start,
-            len(memories),
-        )
+        memory_text = ""
 
-        # 4. Assemble memory text
-        memory_text = self._assemble_memory_text(context, memories)
-        logger.info(
-            "[generate_memory] assembled memory_text length=%s",
-            len(memory_text) if memory_text else 0,
-        )
+        # 3-4. Search and assemble memories (if auto_recall enabled)
+        if self.config.auto_recall:
+            recall_start = time.monotonic()
+            raw_query = extract_latest_user_text(messages)
+            query_text = prepare_recall_query(raw_query)
+            logger.info("[generate_memory] recall query='%s'", query_text[:100])
+
+            if query_text:
+                memories = await self._recall_memories(query_text)
+                logger.info(
+                    "[generate_memory] recall done in %.3fs, memories=%s",
+                    time.monotonic() - recall_start,
+                    len(memories),
+                )
+
+                # 4. Assemble memory text
+                memory_text = self._assemble_memory_text(context, memories)
+                logger.info(
+                    "[generate_memory] assembled memory_text length=%s",
+                    len(memory_text) if memory_text else 0,
+                )
+            else:
+                logger.info("[generate_memory] recall query empty, skipping")
+        else:
+            logger.info("[generate_memory] auto_recall disabled, skipping recall")
 
         # 5. Async commit if threshold exceeded
-        asyncio.create_task(self._maybe_commit(session_id))
+        asyncio.create_task(self._maybe_commit(ov_session_id))
 
         total = time.monotonic() - start
-        logger.info("[generate_memory] complete sessionId=%s total_time=%.3fs", session_id, total)
+        logger.info(
+            "[generate_memory] complete sessionId=%s ovSessionId=%s total_time=%.3fs",
+            session_id,
+            ov_session_id,
+            total,
+        )
+        self._diag(
+            "generate_memory_complete",
+            ov_session_id,
+            {
+                "sessionId": session_id,
+                "total_time": total,
+                "memory_text_length": len(memory_text) if memory_text else 0,
+            },
+        )
         return memory_text
 
     async def _capture_messages(
-        self, session_id: str, messages: list[dict]
+        self, session_id: str, ov_session_id: str, messages: list[dict]
     ) -> None:
         """Append new messages to OpenViking session.
 
+        To avoid duplicate captures in Higo's stateless transform model,
+        we only capture the "current turn" messages:
+        - the most recent assistant message (if any)
+        - the last user message (current user input)
+
         Classification logic:
         - system          -> merged into current user's parts
-        - assistant       -> stored as assistant
+        - assistant       -> stored as assistant (most recent only)
         - user(context)   -> skipped (not real user speech)
         - user(current)   -> stored as user (with system prefix)
         """
@@ -126,93 +214,131 @@ class OpenVikingMemoryEngine(MemoryEngine):
             elif role == "user":
                 user_msgs.append(msg)
 
-        # 2. Identify current user: last user msg; context env: all other user msgs
+        # 2. Identify current turn messages:
+        #    - last assistant = most recent assistant reply
+        #    - last user = current user input
+        current_assistant_msg = assistant_msgs[-1] if assistant_msgs else None
         current_user_msg = user_msgs[-1] if user_msgs else None
         context_env_msgs = user_msgs[:-1] if len(user_msgs) >= 2 else []
 
-        logger.info(
-            "[capture] classified: system=%s assistant=%s user_total=%s "
-            "current_user=%s context_env=%s",
-            bool(system_msg),
-            len(assistant_msgs),
-            len(user_msgs),
-            bool(current_user_msg),
-            len(context_env_msgs),
+        self._diag(
+            "capture_classified",
+            ov_session_id,
+            {
+                "system": bool(system_msg),
+                "assistant_total": len(assistant_msgs),
+                "user_total": len(user_msgs),
+                "current_assistant": bool(current_assistant_msg),
+                "current_user": bool(current_user_msg),
+                "context_env": len(context_env_msgs),
+            },
         )
 
         captured = 0
+        agent_id = self._resolve_agent_id(session_id)
 
-        # 3. Store assistant messages
-        for msg in assistant_msgs:
-            parts = message_to_ov_parts(msg)
+        # 3. Store the most recent assistant message only
+        if current_assistant_msg:
+            parts = message_to_ov_parts(current_assistant_msg)
             if not parts:
-                continue
-            for part in parts:
-                if part.get("type") == "text" and part.get("text"):
-                    part["text"] = sanitize_user_text_for_capture(part["text"])
+                logger.info("[capture] assistant parts empty, skipping")
+            else:
+                for part in parts:
+                    if part.get("type") == "text" and part.get("text"):
+                        part["text"] = sanitize_user_text_for_capture(part["text"])
 
-            try:
-                await self.client.add_session_message(
-                    session_id,
-                    role="assistant",
-                    role_id="assistant",
-                    parts=parts,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+                decision = get_capture_decision(
+                    current_assistant_msg.get("content", ""),
+                    mode=self.config.capture_mode,
+                    capture_max_length=self.config.capture_max_length,
                 )
-                captured += 1
-                logger.info(
-                    "[capture] stored assistant sessionId=%s parts=%s",
-                    session_id,
-                    len(parts),
-                )
-            except Exception as e:
-                logger.warning(
-                    "[capture] failed to store assistant for %s: %s",
-                    session_id,
-                    e,
-                )
+                if not decision["should_capture"]:
+                    logger.info(
+                        "[capture] assistant rejected: reason=%s",
+                        decision["reason"],
+                    )
+                else:
+                    try:
+                        await self.client.add_session_message(
+                            ov_session_id,
+                            role="assistant",
+                            role_id="assistant",
+                            parts=parts,
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        captured += 1
+                        logger.info(
+                            "[capture] stored assistant ovSessionId=%s parts=%s reason=%s",
+                            ov_session_id,
+                            len(parts),
+                            decision["reason"],
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[capture] failed to store assistant for %s: %s",
+                            ov_session_id,
+                            e,
+                        )
 
         # 4. Store current user (merge system into parts)
         if current_user_msg:
             parts = message_to_ov_parts(current_user_msg)
             if parts:
-                # Merge system content into the first text part
-                if system_msg:
-                    system_text = system_msg.get("content", "")
-                    for part in parts:
-                        if part.get("type") == "text":
-                            user_text = part.get("text", "")
-                            part["text"] = f"[system] {system_text}\n\n{user_text}"
-                            break
-
-                # Sanitize
-                for part in parts:
-                    if part.get("type") == "text" and part.get("text"):
-                        part["text"] = sanitize_user_text_for_capture(part["text"])
-
-                try:
-                    await self.client.add_session_message(
-                        session_id,
-                        role="user",
-                        role_id="user",
-                        parts=parts,
-                        created_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                    captured += 1
+                # Apply capture decision
+                decision = get_capture_decision(
+                    current_user_msg.get("content", ""),
+                    mode=self.config.capture_mode,
+                    capture_max_length=self.config.capture_max_length,
+                )
+                if not decision["should_capture"]:
                     logger.info(
-                        "[capture] stored current_user sessionId=%s parts=%s system_merged=%s",
-                        session_id,
-                        len(parts),
-                        bool(system_msg),
+                        "[capture] current_user rejected: reason=%s",
+                        decision["reason"],
                     )
-                except Exception as e:
-                    logger.warning(
-                        "[capture] failed to store current_user for %s: %s",
-                        session_id,
-                        e,
-                    )
+                else:
+                    # Merge system content into the first text part
+                    if system_msg:
+                        system_text = system_msg.get("content", "")
+                        for part in parts:
+                            if part.get("type") == "text":
+                                user_text = part.get("text", "")
+                                part["text"] = f"[system] {system_text}\n\n{user_text}"
+                                break
 
-        logger.info("[capture] total stored=%s/%s", captured, len(messages))
+                    # Sanitize
+                    for part in parts:
+                        if part.get("type") == "text" and part.get("text"):
+                            part["text"] = sanitize_user_text_for_capture(part["text"])
+
+                    try:
+                        await self.client.add_session_message(
+                            ov_session_id,
+                            role="user",
+                            role_id="user",
+                            parts=parts,
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        captured += 1
+                        logger.info(
+                            "[capture] stored current_user ovSessionId=%s parts=%s system_merged=%s reason=%s",
+                            ov_session_id,
+                            len(parts),
+                            bool(system_msg),
+                            decision["reason"],
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[capture] failed to store current_user for %s: %s",
+                            ov_session_id,
+                            e,
+                        )
+
+        logger.info("[capture] total stored=%s", captured)
+        self._diag(
+            "capture_result",
+            ov_session_id,
+            {"total_stored": captured, "agent_id": agent_id},
+        )
 
     async def _recall_memories(self, query_text: str) -> list[dict]:
         """Search user and agent memories in parallel."""
@@ -220,6 +346,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             logger.info("[recall] query is empty, skipping")
             return []
 
+        agent_id = self._resolve_agent_id("")
         user_uri = "viking://user/memories"
         agent_uri = "viking://agent/memories"
 
@@ -236,14 +363,28 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 user_uri,
                 self.config.recall_limit,
                 self.config.recall_score_threshold,
+                agent_id,
             ),
             self._safe_find(
                 query_text,
                 agent_uri,
                 self.config.recall_limit,
                 self.config.recall_score_threshold,
+                agent_id,
             ),
         ]
+
+        # Optionally search resources
+        if self.config.recall_resources:
+            tasks.append(
+                self._safe_find(
+                    query_text,
+                    "viking://resources",
+                    self.config.recall_limit,
+                    self.config.recall_score_threshold,
+                    agent_id,
+                )
+            )
 
         results: list[dict] = []
         find_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -276,11 +417,12 @@ class OpenVikingMemoryEngine(MemoryEngine):
         target_uri: str,
         limit: int,
         score_threshold: float | None,
+        agent_id: str | None = None,
     ) -> dict:
         """Wrapper that catches exceptions."""
         try:
             result = await self.client.find(
-                query, target_uri, limit, score_threshold
+                query, target_uri, limit, score_threshold, agent_id
             )
             memories = result.get("memories", [])
             logger.info(
@@ -316,16 +458,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 lines.append(f"- {archive_id}: {abstract}")
             lines.append("")
 
-        # Relevant memories
+        # Relevant memories (with token budget)
         if memories:
             lines.append("<relevant-memories>")
-            for mem in memories:
-                category = mem.get("category", "memory")
-                content = mem.get("abstract", mem.get("overview", ""))
-                score = mem.get("score", 0)
-                lines.append(
-                    f"- [{category}] {content} ({score:.0%})"
-                )
+            memory_lines = build_memory_lines_with_budget(
+                memories, self.config.recall_token_budget
+            )
+            lines.extend(memory_lines)
             lines.append("</relevant-memories>")
             lines.append("")
 
@@ -339,29 +478,270 @@ class OpenVikingMemoryEngine(MemoryEngine):
         )
         return text
 
-    async def _maybe_commit(self, session_id: str) -> None:
+    async def _maybe_commit(self, ov_session_id: str) -> None:
         """Trigger commit if pending_tokens exceeds threshold."""
         try:
-            session_info = await self.client.get_session(session_id)
+            session_info = await self.client.get_session(ov_session_id)
             pending_tokens = session_info.get("pending_tokens", 0)
             logger.info(
-                "[commit_check] sessionId=%s pending_tokens=%s threshold=%s",
-                session_id,
+                "[commit_check] ovSessionId=%s pending_tokens=%s threshold=%s",
+                ov_session_id,
                 pending_tokens,
                 self.config.commit_token_threshold,
             )
             if pending_tokens > self.config.commit_token_threshold:
                 logger.info(
-                    "[commit] triggering sessionId=%s (pending_tokens=%s > threshold=%s)",
-                    session_id,
+                    "[commit] triggering ovSessionId=%s (pending_tokens=%s > threshold=%s)",
+                    ov_session_id,
                     pending_tokens,
                     self.config.commit_token_threshold,
                 )
-                await self.client.commit_session(
-                    session_id, wait=False
+                commit_result = await self.client.commit_session(
+                    ov_session_id, wait=False
                 )
-                logger.info("[commit] triggered for sessionId=%s", session_id)
+                logger.info(
+                    "[commit] triggered for ovSessionId=%s status=%s archived=%s task_id=%s",
+                    ov_session_id,
+                    commit_result.get("status", "unknown"),
+                    commit_result.get("archived", False),
+                    commit_result.get("task_id", "none"),
+                )
+                self._diag(
+                    "commit_triggered",
+                    ov_session_id,
+                    {
+                        "pending_tokens": pending_tokens,
+                        "threshold": self.config.commit_token_threshold,
+                        "status": commit_result.get("status"),
+                        "archived": commit_result.get("archived"),
+                        "task_id": commit_result.get("task_id"),
+                    },
+                )
             else:
-                logger.info("[commit] skipped for sessionId=%s", session_id)
+                logger.info("[commit] skipped for ovSessionId=%s", ov_session_id)
+                self._diag(
+                    "commit_skipped",
+                    ov_session_id,
+                    {
+                        "pending_tokens": pending_tokens,
+                        "threshold": self.config.commit_token_threshold,
+                        "reason": "below_threshold",
+                    },
+                )
         except Exception as e:
-            logger.warning("[commit] check failed for %s: %s", session_id, e)
+            logger.warning("[commit] check failed for %s: %s", ov_session_id, e)
+            self._diag(
+                "commit_error",
+                ov_session_id,
+                {"error": str(e)},
+            )
+
+    async def compact(self, session_id: str) -> dict:
+        """Force commit a session and return post-compact summary.
+
+        Returns:
+            {
+                "ok": bool,
+                "compacted": bool,
+                "reason": str,
+                "result": {
+                    "summary": str,
+                    "firstKeptEntryId": str,
+                    "tokensBefore": int | None,
+                    "tokensAfter": int | None,
+                }
+            }
+        """
+        ov_session_id = session_to_ov_id(session_id)
+
+        self._diag(
+            "compact_entry",
+            ov_session_id,
+            {"sessionId": session_id, "ovSessionId": ov_session_id},
+        )
+
+        if should_bypass_session(session_id, self._bypass_patterns):
+            logger.info("[compact] session bypassed sessionId=%s", session_id)
+            return {
+                "ok": True,
+                "compacted": False,
+                "reason": "session_bypassed",
+                "result": {
+                    "summary": "",
+                    "firstKeptEntryId": "",
+                    "tokensBefore": None,
+                    "tokensAfter": None,
+                },
+            }
+
+        # Pre-commit token estimate
+        tokens_before: int | None = None
+        try:
+            pre_ctx = await self.client.get_session_context(ov_session_id)
+            estimated = pre_ctx.get("estimatedTokens")
+            if isinstance(estimated, (int, float)) and estimated > 0:
+                tokens_before = int(estimated)
+        except Exception as e:
+            logger.info(
+                "[compact] pre-commit context fetch failed for %s: %s",
+                ov_session_id,
+                e,
+            )
+
+        try:
+            logger.info(
+                "[compact] committing ovSessionId=%s (wait=true)", ov_session_id
+            )
+            commit_result = await self.client.commit_session(
+                ov_session_id, wait=True
+            )
+
+            mem_count = 0
+            extracted = commit_result.get("memories_extracted", {})
+            if isinstance(extracted, dict):
+                mem_count = sum(len(v) for v in extracted.values() if isinstance(v, list))
+
+            logger.info(
+                "[compact] committed ovSessionId=%s archived=%s memories=%s task_id=%s",
+                ov_session_id,
+                commit_result.get("archived", False),
+                mem_count,
+                commit_result.get("task_id", "none"),
+            )
+
+            if commit_result.get("status") == "failed":
+                self._diag(
+                    "compact_result",
+                    ov_session_id,
+                    {
+                        "ok": False,
+                        "compacted": False,
+                        "reason": "commit_failed",
+                        "error": commit_result.get("error", ""),
+                    },
+                )
+                return {
+                    "ok": False,
+                    "compacted": False,
+                    "reason": "commit_failed",
+                    "result": {
+                        "summary": "",
+                        "firstKeptEntryId": "",
+                        "tokensBefore": tokens_before,
+                        "tokensAfter": None,
+                    },
+                }
+
+            if commit_result.get("status") == "timeout":
+                self._diag(
+                    "compact_result",
+                    ov_session_id,
+                    {
+                        "ok": False,
+                        "compacted": False,
+                        "reason": "commit_timeout",
+                    },
+                )
+                return {
+                    "ok": False,
+                    "compacted": False,
+                    "reason": "commit_timeout",
+                    "result": {
+                        "summary": "",
+                        "firstKeptEntryId": "",
+                        "tokensBefore": tokens_before,
+                        "tokensAfter": None,
+                    },
+                }
+
+            if not commit_result.get("archived"):
+                self._diag(
+                    "compact_result",
+                    ov_session_id,
+                    {
+                        "ok": True,
+                        "compacted": False,
+                        "reason": "commit_no_archive",
+                        "memories": mem_count,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "compacted": False,
+                    "reason": "commit_no_archive",
+                    "result": {
+                        "summary": "",
+                        "firstKeptEntryId": "",
+                        "tokensBefore": tokens_before,
+                        "tokensAfter": tokens_before,
+                    },
+                }
+
+            # Fetch post-compact context for summary
+            summary = ""
+            tokens_after: int | None = None
+            first_kept_entry_id = ""
+
+            try:
+                post_ctx = await self.client.get_session_context(ov_session_id)
+                overview = post_ctx.get("latest_archive_overview", "")
+                if isinstance(overview, str):
+                    summary = overview.strip()
+                estimated = post_ctx.get("estimatedTokens")
+                if isinstance(estimated, (int, float)) and estimated > 0:
+                    tokens_after = int(estimated)
+                archive_uri = commit_result.get("archive_uri", "")
+                if archive_uri:
+                    first_kept_entry_id = archive_uri.split("/")[-1]
+            except Exception as e:
+                logger.info(
+                    "[compact] post-commit context fetch failed for %s: %s",
+                    ov_session_id,
+                    e,
+                )
+
+            self._diag(
+                "compact_result",
+                ov_session_id,
+                {
+                    "ok": True,
+                    "compacted": True,
+                    "reason": "commit_completed",
+                    "memories": mem_count,
+                    "tokensBefore": tokens_before,
+                    "tokensAfter": tokens_after,
+                    "latestArchiveId": first_kept_entry_id or None,
+                    "summaryPresent": bool(summary),
+                },
+            )
+
+            return {
+                "ok": True,
+                "compacted": True,
+                "reason": "commit_completed",
+                "result": {
+                    "summary": summary,
+                    "firstKeptEntryId": first_kept_entry_id,
+                    "tokensBefore": tokens_before,
+                    "tokensAfter": tokens_after,
+                },
+            }
+
+        except Exception as e:
+            logger.warning("[compact] failed for %s: %s", ov_session_id, e)
+            self._diag(
+                "compact_error",
+                ov_session_id,
+                {"error": str(e)},
+            )
+            return {
+                "ok": False,
+                "compacted": False,
+                "reason": "commit_error",
+                "result": {
+                    "summary": "",
+                    "firstKeptEntryId": "",
+                    "tokensBefore": tokens_before,
+                    "tokensAfter": None,
+                },
+            }

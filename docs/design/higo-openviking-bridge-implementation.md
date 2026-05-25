@@ -1,0 +1,586 @@
+# Higo OpenViking Bridge — 代码逻辑实现文档
+
+> 本文档描述当前代码的实际实现逻辑，对应 `main` 分支最新状态。
+
+---
+
+## 1. 项目概述
+
+本项目是一个 **Higo Session Memory Plugin**，基于 FastAPI 构建，实现 Higo 插件协议。核心功能是在每次 `transform` 请求时：
+
+1. 将本轮对话消息捕获到 OpenViking 长期记忆系统
+2. 从 OpenViking 召回与当前用户输入相关的记忆
+3. 将记忆文本注入到消息列表中，供 LLM 参考
+
+同时提供 `probe` 健康检查和一个独立的 `/compact` 强制归档端点。
+
+---
+
+## 2. 模块架构
+
+```
+main.py                          ← FastAPI 入口，路由分发
+models.py                        ← Higo 协议 Pydantic 模型
+engine/
+├── config.py                    ← 配置定义与环境变量加载
+├── memory.py                    ← 记忆引擎抽象基类（可扩展）
+├── openviking_engine.py         ← 核心引擎（OpenViking 实现）
+├── openviking_client.py         ← OpenViking HTTP API 客户端
+├── text_utils.py                ← 文本清理、Capture Decision、Query 预处理
+├── memory_ranking.py            ← 记忆后处理：去重、过滤、重排序、预算管理
+├── session_utils.py             ← Session ID 映射（UUID / sha256）
+├── bypass.py                    ← Session Bypass 模式匹配
+├── diagnostics.py               ← 结构化诊断日志
+└── agent_resolver.py            ← Session-Agent ID 解析与缓存
+```
+
+### 依赖关系
+
+- `main.py` 依赖 `models.py` + `engine` 包
+- `openviking_engine.py` 依赖 `config`, `client`, `text_utils`, `memory_ranking`, `session_utils`, `bypass`, `diagnostics`, `agent_resolver`
+- `openviking_client.py` 依赖 `config`
+- 其余模块相互独立，无循环依赖
+
+---
+
+## 3. 请求处理流程
+
+### 3.1 入口路由 `POST /`
+
+`main.py:handle()` 接收所有 Higo 请求，按 `mode` 字段分发：
+
+| mode | 处理函数 | 说明 |
+|------|---------|------|
+| `probe` | `_handle_probe()` | 健康检查 |
+| `transform` | `_handle_transform()` | 消息转换（核心） |
+| 其他 | 返回 400 | 未知 mode |
+
+所有请求和响应都会记录完整 JSON 到日志（`[higo_request]` / `[higo_response]`）。
+
+### 3.2 Probe 模式
+
+`_handle_probe()`（`main.py:81-102`）：
+
+1. 调用 `_ov_client.health_check()` 检查 OpenViking 服务可达性
+2. 返回 `ProbeResponse { ok, summary, engine { name, version } }`
+3. 异常时 `ok=false`，summary 包含错误信息
+
+### 3.3 Transform 模式
+
+`_handle_transform()`（`main.py:105-164`）是核心流程：
+
+```
+1. 记录原始消息列表（role、content_len）
+2. 调用 memory_engine.generate_memory(sessionId, messages)
+   └─ 返回 memory_text（可能为空）
+3. 若 memory_text 非空：
+   └─ 构造 memory_message(role="user", content=memory_text)
+   └─ 调用 _build_messages(original, memory_message) 插入到倒数第1条 user 之前
+4. 若 memory_text 为空：
+   └─ 直接返回原始消息列表（不注入）
+5. 返回 TransformResponse { ok, result { request { messages }, debug { source } }, summary }
+```
+
+#### 消息插入规则 `_build_messages()`
+
+记忆消息必须插入到**最后一条 user 消息之前**，确保最后一条消息仍然是当前用户输入。
+
+```
+Original:  [0]system [1]assistant [2]user(context) [3]user(current)
+After:     [0]system [1]assistant [2]user(context) [3]user(memory) [4]user(current)
+```
+
+实现逻辑：先扫描找到最后一个 `role="user"` 的索引，再遍历插入。
+
+---
+
+## 4. 核心引擎：`OpenVikingMemoryEngine`
+
+`engine/openviking_engine.py:32-747`
+
+### 4.1 初始化
+
+```python
+self.config = config                    # OpenVikingConfig
+self.client = client                    # OpenVikingClient
+self._agent_resolver = AgentResolver(config.agent_id)
+self._bypass_patterns = compile_session_patterns(
+    [p.strip() for p in config.bypass_session_patterns.split(",") if p.strip()]
+)
+```
+
+### 4.2 主入口 `generate_memory()`
+
+整体流程（5 步）：
+
+```
+Step 0: Session ID 映射 + Bypass 检查
+Step 1: Capture messages（消息捕获）
+Step 2: Get session context（获取会话上下文）
+Step 3: Recall memories（记忆召回）
+Step 4: Assemble memory text（组装记忆文本）
+Step 5: Async commit（异步提交）
+```
+
+#### Step 0: Session ID 映射与 Bypass
+
+- 调用 `session_to_ov_id(session_id)` 将 Higo sessionId 映射为 OpenViking 存储 ID
+  - UUID 格式 → 直接使用（小写）
+  - 非 UUID → `sha256(session_id).hexdigest`
+- 检查 `should_bypass_session(session_id, self._bypass_patterns)`
+  - 若匹配 bypass 模式 → 直接返回空字符串（跳过所有处理）
+
+#### Step 1: Capture Messages（`_capture_messages`）
+
+仅在 `auto_capture=True` 时执行。
+
+**核心策略：只捕获当前轮次消息**，避免 Higo 无状态 transform 导致的重复追加。
+
+消息分类：
+
+| 消息角色 | 处理方式 |
+|---------|---------|
+| `system` | 不单独保存，合并到最后一条 user 的首个 text part |
+| `assistant` | 只保存**最近一条**，其余跳过 |
+| `user`（倒数第2条及以前） | 跳过（context env） |
+| `user`（最后一条） | 保存为 current user |
+
+**Capture Decision 过滤**：
+
+每条待捕获消息都经过 `get_capture_decision()` 判断：
+
+1. 先经过 `sanitize_user_text_for_capture()` 清理
+2. 空文本 → 拒绝（reason: `empty_text` 或 `injected_memory_context_only`）
+3. 长度过滤：
+   - 紧凑后长度：CJK ≥4，Latin ≥10
+   - 原始长度 ≤ `capture_max_length`（默认 8192）
+4. Command 过滤：`/^[a-z0-9_-]{1,64}\b` → 拒绝
+5. Non-content 过滤：纯标点/符号/空白 → 拒绝
+6. Subagent Context 过滤：`[Subagent Context]` 开头 → 拒绝
+7. Question-only 过滤：纯问题（不含记忆意图）→ 拒绝
+8. Mode 分支：
+   - `semantic` → 通过（默认）
+   - `keyword` → 需匹配 7 个 MEMORY_TRIGGERS 正则之一才通过
+
+**Assistant 消息存储**：
+- 通过 `message_to_ov_parts()` 转为 OV parts 格式
+- text part 经过 `sanitize_user_text_for_capture()`
+- 调用 `client.add_session_message(role="assistant", ...)`
+
+**User 消息存储**：
+- 通过 `message_to_ov_parts()` 转为 OV parts
+- 若存在 system 消息，将其内容合并到首个 text part：`[system] {system_text}\n\n{user_text}`
+- text part 经过 `sanitize_user_text_for_capture()`
+- 调用 `client.add_session_message(role="user", ...)`
+
+**Agent ID**：调用 `self._resolve_agent_id(session_id)`，通过 `AgentResolver` 解析：
+- 从 `sessionId` 中提取 `agent:xxx:` 前缀中的 agentId
+- 若配置了 `agent_id` 且不为 `default`，前缀格式为 `{config_agent_id}_{raw_agent_id}`
+
+#### Step 2: Get Session Context
+
+调用 `client.get_session_context(ov_session_id)` 获取：
+- `latest_archive_overview` — 最新归档摘要
+- `pre_archive_abstracts` — 历史归档索引
+- `messages` — 当前活跃消息（引擎内部不直接使用，由 OV 服务端管理）
+- `estimatedTokens` — 预估 token 数
+
+异常时记录 warning，context 为空 dict。
+
+#### Step 3-4: Recall + Assemble（仅在 `auto_recall=True` 时执行）
+
+**Query 提取**：
+1. 从 messages 中提取最后一条 user 消息的 `content`
+2. 经过 `prepare_recall_query()` 预处理：
+   - `sanitize_user_text_for_capture()` 清理噪音
+   - 截断到 500 字符（尽可能保留完整单词）
+
+**召回搜索**（`_recall_memories`）：
+
+并行搜索以下 URI：
+- `viking://user/memories`
+- `viking://agent/memories`
+- `viking://resources`（仅在 `recall_resources=True` 时）
+
+每个搜索使用 `recall_limit` 和 `recall_score_threshold` 作为参数。
+
+**后处理流水线**（依次执行）：
+1. `deduplicate_by_uri()` — 按 URI 去重，保留 score 最高的一条
+2. `filter_leaf_memories()` — 只保留 `level == 2` 的叶子记忆
+3. `apply_score_threshold()` — 按 `recall_score_threshold` 过滤
+4. `rerank_memories()` — Query-aware 重排序（见第 7 节）
+
+**文本组装**（`_assemble_memory_text`）：
+
+按以下顺序组装文本块：
+
+```
+[Session History Summary]
+{latest_archive_overview}
+
+[Archive Index]
+- {archive_id}: {abstract}
+...
+
+<relevant-memories>
+- [{category}] {content} ({score})
+...
+</relevant-memories>
+```
+
+记忆行通过 `build_memory_lines_with_budget()` 构建，受 `recall_token_budget` 限制：
+- 第一条记忆**强制包含**（即使超出预算）
+- 后续记忆按 ~4 chars/token 估算，超出预算时停止追加
+
+#### Step 5: Async Commit（`_maybe_commit`）
+
+在 `generate_memory` 末尾通过 `asyncio.create_task()` 异步触发：
+
+1. 调用 `client.get_session(ov_session_id)` 获取 `pending_tokens`
+2. 若 `pending_tokens > commit_token_threshold`（默认 8000）：
+   - 调用 `client.commit_session(ov_session_id, wait=False)`
+   - 返回 `task_id` 用于 Phase 2 异步记忆提取
+3. 否则跳过
+
+### 4.3 强制归档 `compact()`
+
+独立方法，供 `POST /compact` 调用：
+
+1. 映射 session_id → ov_session_id
+2. Bypass 检查
+3. 预获取 session context 记录 `tokensBefore`
+4. 调用 `commit_session(ov_session_id, wait=True)`
+   - `wait=True` 会轮询 Phase 2 直到完成或超时（默认 300s）
+5. 根据 commit 结果状态返回：
+   - `failed` / `timeout` → `ok=false`
+   - `archived=false` → `ok=true, compacted=false`
+   - `archived=true` → 获取 post-compact context，返回 summary + tokensBefore/After
+
+---
+
+## 5. 文本处理模块：`text_utils.py`
+
+### 5.1 文本清理 `sanitize_user_text_for_capture()`
+
+清理顺序（严格按此顺序执行）：
+
+| 步骤 | 正则/逻辑 | 说明 |
+|------|----------|------|
+| 1 | `\bHEARTBEAT(?:\.md\|_OK)\b` | HEARTBEAT 健康检查消息 → 整段清空 |
+| 2 | `^System:\s*\[.*?\]\s*Compacted\s*(.+)$` | Compactor 系统消息 → 提取实际内容 |
+| 3 | `<relevant-memories>[\s\S]*?</relevant-memories>` | 移除已注入的记忆块 |
+| 4 | `Conversation info/metadata/会话信息/对话信息` + fenced code | 移除对话元数据块 |
+| 5 | `Sender (...) : ```...``` ` | 移除 Sender 元数据块 |
+| 6 | ````json ... ````（若含 ≥3 个 metadata keys） | 条件移除 fenced JSON |
+| 7 | `^\[(Mon\|Tue\|...)?\s*日期时间\]\s*` | 移除 leading timestamp |
+| 8 | `\u0000` | 移除 null bytes |
+| 9 | `\s+ → " "` | 折叠多余空白 |
+
+Metadata keys 检测集合：`session, sessionid, sessionkey, conversationid, channel, sender, userid, agentid, timestamp, timezone`
+
+### 5.2 Capture Decision `get_capture_decision()`
+
+返回结构：`{ should_capture: bool, reason: str, normalized_text: str }`
+
+**过滤规则执行顺序**：
+
+1. **Empty** → `empty_text` / `injected_memory_context_only`
+2. **Length** → `length_out_of_range`
+   - CJK 紧凑长度 ≥ 4，Latin ≥ 10
+   - 原始长度 ≤ `capture_max_length`
+3. **Command** → `command_text`
+4. **Non-content** → `non_content_text`
+   - 使用 `unicodedata.category(ch)` 判断，仅 P/S/Z 类别通过
+5. **Subagent** → `subagent_context`
+6. **Question-only** → `question_text`
+   - 含疑问词/问号，但不含记忆意图关键词
+   - 多说话者（≥2 个 speaker tags）或长度 > 280 则豁免
+7. **Mode 分支**：
+   - `semantic` → `semantic_candidate`
+   - `keyword` → 匹配 7 个 `MEMORY_TRIGGERS` 正则
+
+### 5.3 Memory Triggers（Keyword 模式）
+
+| # | 正则 | 匹配内容 |
+|---|------|---------|
+| 1 | `remember\|preference\|prefer\|important\|decision\|decided\|always\|never` | 英文记忆关键词 |
+| 2 | `记住\|偏好\|喜欢\|...\|不喜欢` | 中文记忆关键词 |
+| 3 | `[\w.-]+@[\w.-]+\.\w+` | 邮箱地址 |
+| 4 | `\+\d{10,}` | 电话号码 |
+| 5 | `(我\|my)\s*(是\|叫\|名字\|...\|邮箱\|email)` | 自我介绍模式 |
+| 6 | `(我\|i)\s*(喜欢\|崇拜\|讨厌\|...\|相信)` | 偏好/情感表达 |
+| 7 | `favorite\|favourite\|love\|hate\|...\|fan of` | 英文偏好关键词 |
+
+### 5.4 Query 预处理 `prepare_recall_query()`
+
+1. `sanitize_user_text_for_capture()` 清理
+2. 截断到 500 字符
+3. 尽量在单词边界截断（寻找最后一个空格，若位置 > 80% 长度则从此截断）
+
+---
+
+## 6. 记忆排序与预算：`memory_ranking.py`
+
+### 6.1 后处理流水线
+
+| 函数 | 作用 | 输入 |
+|------|------|------|
+| `deduplicate_by_uri()` | 按 URI 去重，保留 score 最高 | raw results |
+| `filter_leaf_memories()` | 只保留 `level == 2` | deduped |
+| `apply_score_threshold()` | score ≥ threshold | leaf |
+| `rerank_memories()` | Query-aware 重排序 | thresholded |
+
+### 6.2 Query-Aware 重排序
+
+对每条记忆计算 boost 后的 score：
+
+```
+boosted_score = base_score
+              + leaf_boost(0.12)
+              + event_temporal_boost(0.1)
+              + preference_boost(0.08)
+              + lexical_overlap_boost(0~0.2)
+```
+
+| Boost | 触发条件 | 值 |
+|-------|---------|-----|
+| Leaf | `level == 2` | +0.12 |
+| Event Temporal | query 含时间词 **且** `category == "events"` | +0.1 |
+| Preference | query 含偏好词 **且** `category == "preferences"` | +0.08 |
+| Lexical Overlap | query 词在 `abstract + overview + uri` 中出现次数 | +0.05/词，上限 0.2 |
+
+Temporal 关键词：`when, time, date, yesterday, today, tomorrow, last week, before, after, 之前, 之后, 昨天, 今天, 明天, 上周`
+
+Preference 关键词：`prefer, like, want, 喜欢, 偏好, 习惯, preference`
+
+### 6.3 Token Budget 注入
+
+`build_memory_lines_with_budget(results, token_budget)`：
+
+- 第 1 条记忆**强制包含**（即使超出预算）
+- 第 2 条起：估算当前已用 token = `len("\n".join(lines)) // 4`
+- 若 `estimated_tokens < token_budget` 则追加，否则停止
+
+行格式：`- [{category}] {abstract/overview} ({score:.0%})`
+
+---
+
+## 7. Session 管理
+
+### 7.1 Session ID 映射 `session_utils.py`
+
+```python
+def session_to_ov_id(session_id: str) -> str:
+    # UUID → 直接使用（小写）
+    # 非 UUID → sha256(session_id).hexdigest
+```
+
+目的：
+- 将任意 Higo sessionId 映射为稳定的 OV 存储 ID
+- 非 UUID sessionId（如包含特殊字符）通过 sha256 哈希确保文件系统安全
+
+### 7.2 Bypass 模式 `bypass.py`
+
+Glob-like 语法编译为 regex：
+
+| Glob | Regex | 说明 |
+|------|-------|------|
+| `*` | `[^:]*` | 匹配单段（不含 `:`） |
+| `**` | `.*` | 匹配任意字符（含 `:`） |
+
+配置方式：`OPENVIKING_BYPASS_SESSION_PATTERNS=agent:*:cron:**,test:**`
+
+匹配对象：原始 `sessionId`（非映射后的 ov_session_id）。
+
+### 7.3 Agent 解析 `agent_resolver.py`
+
+从 `sessionId` 提取 `agent:xxx:` 前缀中的 agentId，支持配置前缀：
+
+| config.agent_id | raw_agent_id | 结果 |
+|-----------------|-------------|------|
+| `default` | `myagent` | `myagent` |
+| `prefix` | `myagent` | `prefix_myagent` |
+| `default` | 无 | `default` |
+
+解析结果缓存于 `dict[str, str]` 中。
+
+---
+
+## 8. 诊断日志 `diagnostics.py`
+
+统一格式：
+
+```
+openviking: diag {"ts": 1716633600000, "stage": "...", "sessionId": "...", "data": {...}}
+```
+
+通过 `emit_diag(stage, session_id, data, enabled)` 输出，受 `emit_diagnostics` 配置开关控制。
+
+当前使用的 stage：
+
+| Stage | 位置 | 数据内容 |
+|-------|------|---------|
+| `generate_memory_entry` | `generate_memory` 开头 | sessionId, ovSessionId, msg_count, auto_capture, auto_recall |
+| `generate_memory_skip` | bypass 时 | reason: session_bypassed |
+| `generate_memory_complete` | `generate_memory` 结尾 | total_time, memory_text_length |
+| `capture_classified` | `_capture_messages` 分类后 | system, assistant_total, user_total, current_assistant, current_user, context_env |
+| `capture_result` | `_capture_messages` 结尾 | total_stored, agent_id |
+| `commit_triggered` | `_maybe_commit` 触发 commit 时 | pending_tokens, threshold, status, archived, task_id |
+| `commit_skipped` | `_maybe_commit` 跳过时 | pending_tokens, threshold, reason |
+| `commit_error` | `_maybe_commit` 异常时 | error |
+| `compact_entry` | `compact` 开头 | sessionId, ovSessionId |
+| `compact_result` | `compact` 各种结果 | ok, compacted, reason, memories, tokensBefore/After |
+| `compact_error` | `compact` 异常时 | error |
+
+---
+
+## 9. OpenViking HTTP 客户端
+
+`engine/openviking_client.py`
+
+基于 `httpx.AsyncClient` 的异步 HTTP 客户端，封装了 OpenViking 的所有 API。
+
+### 9.1 认证与路由头
+
+```
+X-API-Key          ← config.api_key
+X-OpenViking-Account ← config.account_id
+X-OpenViking-User  ← config.user_id
+X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
+```
+
+### 9.2 核心 API 方法
+
+| 方法 | HTTP | 路径 | 说明 |
+|------|------|------|------|
+| `health_check()` | GET | `/health` | 健康检查 |
+| `find()` | POST | `/api/v1/search/find` | 语义搜索 |
+| `add_session_message()` | POST | `/api/v1/sessions/{id}/messages` | 追加消息到 session |
+| `get_session()` | GET | `/api/v1/sessions/{id}` | 获取 session 元数据（含 pending_tokens） |
+| `get_session_context()` | GET | `/api/v1/sessions/{id}/context?token_budget=` | 获取组装后的 session 上下文 |
+| `commit_session()` | POST | `/api/v1/sessions/{id}/commit` | 触发归档 + 记忆提取 |
+| `get_task()` | GET | `/api/v1/tasks/{task_id}` | 查询后台任务状态 |
+| `get_session_archive()` | GET | `/api/v1/sessions/{id}/archives/{archiveId}` | 获取归档详情 |
+| `delete_session()` | DELETE | `/api/v1/sessions/{id}` | 删除 session |
+| `delete_uri()` | DELETE | `/api/v1/fs?uri=` | 删除 URI |
+
+### 9.3 Commit 的 Phase 2 轮询
+
+`commit_session(wait=True)` 时：
+
+1. 先发起 `POST /api/v1/sessions/{id}/commit` 获取 `task_id`
+2. 轮询 `GET /api/v1/tasks/{task_id}` 直到：
+   - `status == "completed"` → 返回合并结果（含 `memories_extracted`）
+   - `status == "failed"` → 返回失败结果
+   - 超时（默认 300s）→ 返回 `status="timeout"`
+3. 轮询间隔 0.5s
+
+---
+
+## 10. 配置项完整说明
+
+| 环境变量 | 默认值 | 类型 | 说明 |
+|---------|--------|------|------|
+| `OPENVIKING_BASE_URL` | `http://127.0.0.1:1933` | str | OpenViking 服务地址 |
+| `OPENVIKING_API_KEY` | `""` | str | API Key |
+| `OPENVIKING_AGENT_ID` | `default` | str | 默认 Agent ID |
+| `OPENVIKING_ACCOUNT_ID` | `""` | str | 账户 ID |
+| `OPENVIKING_USER_ID` | `""` | str | 用户 ID |
+| `OPENVIKING_TIMEOUT_MS` | `30000` | int | HTTP 请求超时（毫秒） |
+| `OPENVIKING_COMMIT_TOKEN_THRESHOLD` | `8000` | int | 自动提交 token 阈值 |
+| `OPENVIKING_RECALL_LIMIT` | `10` | int | 召回结果数量上限 |
+| `OPENVIKING_RECALL_SCORE_THRESHOLD` | `0.1` | float | 召回最低相似度阈值 |
+| `OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT` | `false` | bool | 按 Agent 隔离用户作用域 |
+| `OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER` | `true` | bool | 按用户隔离 Agent 作用域 |
+| `OPENVIKING_AUTO_CAPTURE` | `true` | bool | 是否自动捕获消息 |
+| `OPENVIKING_AUTO_RECALL` | `true` | bool | 是否自动召回记忆 |
+| `OPENVIKING_CAPTURE_MODE` | `semantic` | str | 捕获模式：`semantic` 或 `keyword` |
+| `OPENVIKING_CAPTURE_MAX_LENGTH` | `8192` | int | 单条消息最大捕获长度 |
+| `OPENVIKING_BYPASS_SESSION_PATTERNS` | `""` | str | Bypass 模式列表，逗号分隔 |
+| `OPENVIKING_RECALL_TOKEN_BUDGET` | `2000` | int | 注入记忆的 token 预算 |
+| `OPENVIKING_RECALL_RESOURCES` | `false` | bool | 是否同时搜索 resources |
+| `OPENVIKING_EMIT_DIAGNOSTICS` | `true` | bool | 是否输出结构化诊断日志 |
+
+---
+
+## 11. 独立 API：`POST /compact`
+
+非 Higo 协议端点，用于外部触发强制归档。
+
+**请求**：
+```json
+{ "sessionId": "abc-123" }
+```
+
+**响应**：
+```json
+{
+  "ok": true,
+  "compacted": true,
+  "reason": "commit_completed",
+  "result": {
+    "summary": "用户讨论了...",
+    "firstKeptEntryId": "archive_003",
+    "tokensBefore": 15000,
+    "tokensAfter": 3200
+  }
+}
+```
+
+状态说明：
+
+| `compacted` | `reason` | 含义 |
+|------------|----------|------|
+| true | `commit_completed` | 归档成功 |
+| false | `session_bypassed` | Session 被 bypass 跳过 |
+| false | `commit_no_archive` | 提交成功但无内容可归档 |
+| false | `commit_failed` | Phase 2 执行失败 |
+| false | `commit_timeout` | Phase 2 轮询超时 |
+| false | `commit_error` | 提交过程异常 |
+
+---
+
+## 12. 关键边界与注意事项
+
+### 12.1 重复 Capture 问题
+
+Higo 协议无 `prePromptMessageCount`，引擎采用**启发式策略**：只 capture 最近一条 assistant + 最后一条 user。这意味着：
+- 若 Higo 传入的消息列表包含多轮历史 assistant，旧轮次的 assistant 不会被 capture
+- 这是当前协议约束下的最优近似方案
+
+### 12.2 Session ID 映射变更影响
+
+启用 `session_to_ov_id()` 后，非 UUID 的 sessionId 会映射为 sha256 哈希值。已有 OV session 数据（使用原始 sessionId 作为 key）将**不可见**。如需迁移，需手动将旧 session 数据关联到新 ID。
+
+### 12.3 结构化 Tool 消息限制
+
+Higo `Message` 模型只有 `{role, content}` 字符串字段，无法传递 `toolCallId`、`toolName`、`toolInput` 等结构化信息。因此当前实现中 tool 消息仅保存为 `{type: "tool", tool_output: content}`，丢失了 tool 元数据。
+
+### 12.4 Capture Decision 的 `keyword` 模式风险
+
+`keyword` 模式可能漏掉不含 trigger 但语义有价值的输入。建议生产环境使用默认的 `semantic` 模式。
+
+### 12.5 Token 预算估算
+
+`build_memory_lines_with_budget()` 使用 `~4 chars/token` 的粗略估算。实际 token 数取决于模型 tokenizer，估算值仅供参考。
+
+---
+
+## 13. 扩展接口
+
+### 13.1 替换 Memory Engine
+
+如需替换 OpenViking 实现：
+
+1. 在 `engine/memory.py` 中已有抽象基类 `MemoryEngine`：
+   ```python
+   class MemoryEngine(ABC):
+       @abstractmethod
+       async def generate_memory(self, session_id: str, messages: list[dict]) -> str:
+           ...
+   ```
+2. 新建子类实现 `generate_memory()`
+3. 在 `engine/__init__.py` 中导出
+4. 在 `main.py` 中替换 `OpenVikingMemoryEngine()` 为新实例
+
+`PlaceholderMemoryEngine` 是示例占位实现，返回固定格式字符串。

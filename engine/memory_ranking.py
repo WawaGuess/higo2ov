@@ -58,6 +58,7 @@ def rerank_memories(results: list[dict], query: str) -> list[dict]:
 
     is_temporal = any(kw in query_lower for kw in temporal_keywords)
     is_preference = any(kw in query_lower for kw in preference_keywords)
+    query_words = set(query_lower.split())
 
     def score_boost(r: dict) -> float:
         base = r.get("score", 0)
@@ -70,9 +71,11 @@ def rerank_memories(results: list[dict], query: str) -> list[dict]:
         # Preference boost
         if is_preference and r.get("category") == "preferences":
             base += 0.08
-        # Lexical overlap boost
-        content = (r.get("abstract", "") + " " + r.get("overview", "")).lower()
-        query_words = set(query_lower.split())
+        # Lexical overlap boost on abstract + overview + uri
+        content = (
+            (r.get("abstract", "") + " " + r.get("overview", "") + " " + r.get("uri", ""))
+            .lower()
+        )
         overlap = sum(1 for word in query_words if word in content)
         base += min(overlap * 0.05, 0.2)
         return base
@@ -87,6 +90,7 @@ def build_memory_lines_with_budget(
     """Build memory lines within a token budget.
 
     The first memory is always included even if it exceeds budget (bounded overshoot).
+    Uses a rough heuristic of ~4 chars per token.
     """
     lines: list[str] = []
     for i, r in enumerate(results):

@@ -64,6 +64,20 @@ async def handle(request: Request):
     return resp
 
 
+@app.post("/compact")
+async def compact(request: Request):
+    """Force-commit an OpenViking session and return the post-compact summary."""
+    body = await request.json()
+    session_id = body.get("sessionId", "")
+    if not session_id:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "sessionId is required"},
+        )
+    result = await memory_engine.compact(session_id)
+    return JSONResponse(content=result)
+
+
 async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
     """Probe: check OpenViking connectivity in addition to local health."""
     logger.info(
