@@ -36,6 +36,11 @@ def sanitize_user_text_for_capture(text: str) -> str:
     return text.strip()
 
 
+def strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks and their contents."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 def message_to_ov_parts(message: dict) -> list[dict]:
     """Convert a single Higo message dict to OpenViking parts format."""
     role = message.get("role", "")
@@ -47,7 +52,7 @@ def message_to_ov_parts(message: dict) -> list[dict]:
     if role == "user":
         return [{"type": "text", "text": content}]
     elif role == "assistant":
-        return [{"type": "text", "text": content}]
+        return [{"type": "text", "text": strip_think_tags(content)}]
     elif role == "tool":
         return [
             {
