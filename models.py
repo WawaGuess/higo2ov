@@ -27,12 +27,12 @@ class Meta(BaseModel):
 class BaseRequest(BaseModel):
     mode: Literal["probe", "transform"]
     sessionId: str
-    source: str
 
 
 class ProbeRequest(BaseRequest):
     mode: Literal["probe"] = "probe"
     timestamp: str
+    source: str
 
 
 class TransformRequest(BaseRequest):
