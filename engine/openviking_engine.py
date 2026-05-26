@@ -20,7 +20,6 @@ from engine.openviking_client import OpenVikingClient
 from engine.session_utils import session_to_ov_id
 from engine.text_utils import (
     extract_latest_user_text,
-    get_capture_decision,
     message_to_ov_parts,
     prepare_recall_query,
     sanitize_user_text_for_capture,
@@ -45,6 +44,8 @@ class OpenVikingMemoryEngine(MemoryEngine):
         self._bypass_patterns = compile_session_patterns(
             [p.strip() for p in config.bypass_session_patterns.split(",") if p.strip()]
         )
+        # Round-id deduplication for result callback idempotency (keep last 1000)
+        self._processed_round_ids: set[str] = set()
 
     def _diag(
         self, stage: str, session_id: str, data: dict
@@ -187,37 +188,29 @@ class OpenVikingMemoryEngine(MemoryEngine):
     async def _capture_messages(
         self, session_id: str, ov_session_id: str, messages: list[dict]
     ) -> None:
-        """Append new messages to OpenViking session.
+        """Append user message to OpenViking session during transform.
 
-        To avoid duplicate captures in Higo's stateless transform model,
-        we only capture the "current turn" messages:
-        - the most recent assistant message (if any)
-        - the last user message (current user input)
+        In Higo V2, transform request only contains the current user input
+        (no assistant reply). Assistant capture happens in capture_round_result().
 
         Classification logic:
         - system          -> merged into current user's parts
-        - assistant       -> stored as assistant (most recent only)
+        - assistant       -> skipped (captured in result callback)
         - user(context)   -> skipped (not real user speech)
         - user(current)   -> stored as user (with system prefix)
         """
         # 1. Classify messages by role
         system_msg: dict | None = None
-        assistant_msgs: list[dict] = []
         user_msgs: list[dict] = []
 
         for msg in messages:
             role = msg.get("role", "")
             if role == "system":
                 system_msg = msg
-            elif role == "assistant":
-                assistant_msgs.append(msg)
             elif role == "user":
                 user_msgs.append(msg)
 
-        # 2. Identify current turn messages:
-        #    - last assistant = most recent assistant reply
-        #    - last user = current user input
-        current_assistant_msg = assistant_msgs[-1] if assistant_msgs else None
+        # 2. Identify current user message
         current_user_msg = user_msgs[-1] if user_msgs else None
         context_env_msgs = user_msgs[:-1] if len(user_msgs) >= 2 else []
 
@@ -226,9 +219,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             ov_session_id,
             {
                 "system": bool(system_msg),
-                "assistant_total": len(assistant_msgs),
                 "user_total": len(user_msgs),
-                "current_assistant": bool(current_assistant_msg),
                 "current_user": bool(current_user_msg),
                 "context_env": len(context_env_msgs),
             },
@@ -237,79 +228,25 @@ class OpenVikingMemoryEngine(MemoryEngine):
         captured = 0
         agent_id = self._resolve_agent_id(session_id)
 
-        # 3. Store the most recent assistant message only
-        if current_assistant_msg:
-            parts = message_to_ov_parts(current_assistant_msg)
-            if not parts:
-                logger.info("[capture] assistant parts empty, skipping")
-            else:
+        # 3. Store current user (merge system into parts)
+        if current_user_msg:
+            parts = message_to_ov_parts(current_user_msg)
+            if parts:
+                # Merge system content into the first text part
+                if system_msg:
+                    system_text = system_msg.get("content", "")
+                    for part in parts:
+                        if part.get("type") == "text":
+                            user_text = part.get("text", "")
+                            part["text"] = f"[system] {system_text}\n\n{user_text}"
+                            break
+
+                # Sanitize
                 for part in parts:
                     if part.get("type") == "text" and part.get("text"):
                         part["text"] = sanitize_user_text_for_capture(part["text"])
 
-                decision = get_capture_decision(
-                    current_assistant_msg.get("content", ""),
-                    mode=self.config.capture_mode,
-                    capture_max_length=self.config.capture_max_length,
-                )
-                if not decision["should_capture"]:
-                    logger.info(
-                        "[capture] assistant rejected: reason=%s",
-                        decision["reason"],
-                    )
-                else:
-                    try:
-                        await self.client.add_session_message(
-                            ov_session_id,
-                            role="assistant",
-                            role_id="assistant",
-                            parts=parts,
-                            created_at=datetime.now(timezone.utc).isoformat(),
-                        )
-                        captured += 1
-                        logger.info(
-                            "[capture] stored assistant ovSessionId=%s parts=%s reason=%s",
-                            ov_session_id,
-                            len(parts),
-                            decision["reason"],
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[capture] failed to store assistant for %s: %s",
-                            ov_session_id,
-                            e,
-                        )
-
-        # 4. Store current user (merge system into parts)
-        if current_user_msg:
-            parts = message_to_ov_parts(current_user_msg)
-            if parts:
-                # Apply capture decision
-                decision = get_capture_decision(
-                    current_user_msg.get("content", ""),
-                    mode=self.config.capture_mode,
-                    capture_max_length=self.config.capture_max_length,
-                )
-                if not decision["should_capture"]:
-                    logger.info(
-                        "[capture] current_user rejected: reason=%s",
-                        decision["reason"],
-                    )
-                else:
-                    # Merge system content into the first text part
-                    if system_msg:
-                        system_text = system_msg.get("content", "")
-                        for part in parts:
-                            if part.get("type") == "text":
-                                user_text = part.get("text", "")
-                                part["text"] = f"[system] {system_text}\n\n{user_text}"
-                                break
-
-                    # Sanitize
-                    for part in parts:
-                        if part.get("type") == "text" and part.get("text"):
-                            part["text"] = sanitize_user_text_for_capture(part["text"])
-
+                if parts and any(p.get("text") for p in parts):
                     try:
                         await self.client.add_session_message(
                             ov_session_id,
@@ -320,11 +257,10 @@ class OpenVikingMemoryEngine(MemoryEngine):
                         )
                         captured += 1
                         logger.info(
-                            "[capture] stored current_user ovSessionId=%s parts=%s system_merged=%s reason=%s",
+                            "[capture] stored current_user ovSessionId=%s parts=%s system_merged=%s",
                             ov_session_id,
                             len(parts),
                             bool(system_msg),
-                            decision["reason"],
                         )
                     except Exception as e:
                         logger.warning(
@@ -745,3 +681,104 @@ class OpenVikingMemoryEngine(MemoryEngine):
                     "tokensAfter": None,
                 },
             }
+
+    async def capture_round_result(
+        self, session_id: str, sections: list[dict], round_id: str = ""
+    ) -> int:
+        """Capture assistant reply and tool results from round sections.
+
+        Called by the result callback at the end of a round.
+        Returns the number of messages captured.
+        """
+        ov_session_id = session_to_ov_id(session_id)
+        agent_id = self._resolve_agent_id(session_id)
+
+        # Idempotency: skip if this roundId was already processed
+        if round_id and round_id in self._processed_round_ids:
+            logger.info(
+                "[capture_result] roundId=%s already processed, skipping",
+                round_id,
+            )
+            return 0
+        if round_id:
+            self._processed_round_ids.add(round_id)
+            # Keep set bounded to ~1000 entries
+            if len(self._processed_round_ids) > 1000:
+                self._processed_round_ids = set(list(self._processed_round_ids)[-500:])
+
+        self._diag(
+            "capture_round_result_entry",
+            ov_session_id,
+            {
+                "sessionId": session_id,
+                "roundId": round_id,
+                "section_count": len(sections),
+            },
+        )
+
+        captured = 0
+        for section in sections:
+            sec_type = section.get("type", "")
+
+            if sec_type == "content" and section.get("content"):
+                text = sanitize_user_text_for_capture(section["content"])
+                if not text:
+                    continue
+                try:
+                    await self.client.add_session_message(
+                        ov_session_id,
+                        role="assistant",
+                        role_id="assistant",
+                        parts=[{"type": "text", "text": text}],
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    captured += 1
+                    logger.info(
+                        "[capture_result] stored assistant ovSessionId=%s",
+                        ov_session_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[capture_result] failed to store assistant: %s", e
+                    )
+
+            elif sec_type == "tool":
+                parts = [
+                    {
+                        "type": "tool",
+                        "tool_id": section.get("toolCallId"),
+                        "tool_name": section.get("toolname"),
+                        "tool_input": section.get("toolargs"),
+                        "tool_output": section.get("toolrsp"),
+                    }
+                ]
+                try:
+                    await self.client.add_session_message(
+                        ov_session_id,
+                        role="user",
+                        role_id="user",
+                        parts=parts,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    captured += 1
+                    logger.info(
+                        "[capture_result] stored tool result ovSessionId=%s tool=%s",
+                        ov_session_id,
+                        section.get("toolname"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[capture_result] failed to store tool: %s", e
+                    )
+
+        logger.info(
+            "[capture_result] total stored=%s roundId=%s",
+            captured,
+            round_id,
+        )
+        self._diag(
+            "capture_round_result_complete",
+            ov_session_id,
+            {"captured": captured, "agent_id": agent_id, "roundId": round_id},
+        )
+        return captured

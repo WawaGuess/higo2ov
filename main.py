@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -10,7 +11,9 @@ from models import (
     Message,
     ProbeRequest,
     ProbeResponse,
+    ResultAck,
     ResultRequest,
+    ResultResponse,
     TransformRequest,
     TransformResponse,
     TransformResult,
@@ -23,7 +26,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Higo Session Memory Plugin")
 
 ENGINE_NAME = "higo-openviking-bridge"
-ENGINE_VERSION = "1.0.0"
+ENGINE_VERSION = "1.1.0"
 
 # Initialize OpenViking engine
 _ov_config = OpenVikingConfig.from_env()
@@ -47,6 +50,9 @@ async def handle(request: Request):
     elif mode == "transform":
         transform_req = TransformRequest.model_validate(body)
         resp = await _handle_transform(transform_req)
+    elif mode == "result":
+        result_req = ResultRequest.model_validate(body)
+        resp = await _handle_result(result_req)
     else:
         logger.error("[handle] unknown mode: %s", mode)
         resp = JSONResponse(
@@ -80,9 +86,11 @@ async def compact(request: Request):
 
 async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
     """Probe: check OpenViking connectivity in addition to local health."""
+    # Prefer new V2 session.sessionId, fall back to legacy sessionId
+    sid = request.session.sessionId if request.session else request.sessionId
     logger.info(
         "[probe] sessionId=%s timestamp=%s",
-        request.sessionId,
+        sid,
         request.timestamp,
     )
     try:
@@ -105,14 +113,32 @@ async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
 async def _handle_transform(
     request: TransformRequest,
 ) -> TransformResponse:
+    # Prefer new V2 fields, fall back to legacy
+    sid = request.session.sessionId if request.session else request.sessionId
     original_messages = request.request.messages
+    anchor_seq = (
+        request.round.seq
+        if request.round
+        else (request.anchor.seq if request.anchor else 0)
+    )
+    anchor_sub = (
+        0
+        if request.round
+        else (request.anchor.subSeq if request.anchor else 0)
+    )
+    model_tokens = (
+        request.meta.modelContextWindowTokens
+        if request.meta
+        else 0
+    )
+
     logger.info(
         "[transform] sessionId=%s anchor=%s/%s msg_count=%s modelTokens=%s",
-        request.sessionId,
-        request.anchor.seq,
-        request.anchor.subSeq,
+        sid,
+        anchor_seq,
+        anchor_sub,
         len(original_messages),
-        request.meta.modelContextWindowTokens,
+        model_tokens,
     )
     for i, msg in enumerate(original_messages):
         logger.info(
@@ -123,7 +149,7 @@ async def _handle_transform(
         )
 
     memory_text = await memory_engine.generate_memory(
-        request.sessionId,
+        sid,
         [m.model_dump() for m in original_messages],
     )
     logger.info(
@@ -157,10 +183,64 @@ async def _handle_transform(
     return TransformResponse(
         ok=True,
         result=TransformResult(
-            request=ResultRequest(messages=new_messages),
+            request={"messages": new_messages},
             debug=DebugInfo(source=ENGINE_NAME),
+            pluginContext={"memoryRevision": "higo-ov-r1"},
         ),
         summary="transform ok",
+    )
+
+
+async def _handle_result(request: ResultRequest) -> ResultResponse:
+    """Handle round result callback from Higo.
+
+    Captures assistant reply and tool results from message.sections
+    into OpenViking session storage.
+    """
+    session_id = request.session.sessionId
+    round_id = request.round.get("roundId", "unknown")
+    status = request.round.get("status", "unknown")
+
+    logger.info(
+        "[result] sessionId=%s roundId=%s status=%s sections=%s errors=%s",
+        session_id,
+        round_id,
+        status,
+        len(request.message.sections),
+        len(request.errors),
+    )
+
+    # Capture assistant reply and tool results from sections
+    captured = 0
+    if request.message.sections:
+        captured = await memory_engine.capture_round_result(
+            session_id,
+            [s.model_dump() for s in request.message.sections],
+            round_id=round_id,
+        )
+
+    # Async commit if threshold exceeded
+    from engine.session_utils import session_to_ov_id
+    ov_session_id = session_to_ov_id(session_id)
+    asyncio.get_event_loop().create_task(
+        memory_engine._maybe_commit(ov_session_id)
+    )
+
+    logger.info(
+        "[result] complete sessionId=%s roundId=%s captured=%s",
+        session_id,
+        round_id,
+        captured,
+    )
+
+    return ResultResponse(
+        ok=True,
+        summary="result accepted",
+        ack=ResultAck(
+            roundId=round_id,
+            stored=True,
+            memoryRevision="higo-ov-r1",
+        ),
     )
 
 

@@ -73,7 +73,7 @@ def rerank_memories(results: list[dict], query: str) -> list[dict]:
             base += 0.08
         # Lexical overlap boost on abstract + overview + uri
         content = (
-            (r.get("abstract", "") + " " + r.get("overview", "") + " " + r.get("uri", ""))
+            ((r.get("abstract") or "") + " " + (r.get("overview") or "") + " " + (r.get("uri") or ""))
             .lower()
         )
         overlap = sum(1 for word in query_words if word in content)
@@ -95,7 +95,7 @@ def build_memory_lines_with_budget(
     lines: list[str] = []
     for i, r in enumerate(results):
         category = r.get("category", "memory")
-        content = r.get("abstract", r.get("overview", ""))
+        content = r.get("abstract") or r.get("overview") or ""
         score = r.get("score", 0)
         line = f"- [{category}] {content} ({score:.0%})"
         if i == 0:

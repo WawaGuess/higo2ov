@@ -137,6 +137,7 @@ def sanitize_user_text_for_capture(text: str) -> str:
     text = _RELEVANT_MEMORIES_BLOCK_RE.sub(" ", text)
     text = _CONVERSATION_METADATA_BLOCK_RE.sub(" ", text)
     text = _SENDER_METADATA_BLOCK_RE.sub(" ", text)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
 
     # 4. Strip fenced JSON only if it looks like metadata
     def _replace_json_block(m: re.Match) -> str:
@@ -161,8 +162,8 @@ def sanitize_user_text_for_capture(text: str) -> str:
 
 
 def _resolve_capture_min_length(text: str) -> int:
-    """CJK chars need shorter minimum (4) than Latin (10)."""
-    return 4 if _CJK_CHAR_RE.search(text) else 10
+    """CJK minimum length lowered to 0 to preserve short greetings."""
+    return 0 if _CJK_CHAR_RE.search(text) else 10
 
 
 def looks_like_question_only_text(text: str) -> bool:
