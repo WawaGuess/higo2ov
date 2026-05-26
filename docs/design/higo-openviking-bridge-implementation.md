@@ -6,11 +6,11 @@
 
 ## 1. 项目概述
 
-本项目是一个 **Higo Session Memory Plugin**，基于 FastAPI 构建，实现 Higo 插件协议。核心功能是在每次 `transform` 请求时：
+本项目是一个 **Higo Session Memory Plugin**，基于 FastAPI 构建，实现 **Higo V2 插件协议**。核心功能分布在 `transform` 和 `result` 两个阶段：
 
-1. 将本轮对话消息捕获到 OpenViking 长期记忆系统
-2. 从 OpenViking 召回与当前用户输入相关的记忆
-3. 将记忆文本注入到消息列表中，供 LLM 参考
+1. `transform` 阶段捕获当前 user 输入，并从 OpenViking 召回相关记忆
+2. 将记忆文本注入到消息列表中，供 LLM 参考
+3. `result` 阶段捕获 assistant 回复和 tool 结果
 
 同时提供 `probe` 健康检查和一个独立的 `/compact` 强制归档端点。
 
@@ -53,6 +53,7 @@ engine/
 |------|---------|------|
 | `probe` | `_handle_probe()` | 健康检查 |
 | `transform` | `_handle_transform()` | 消息转换（核心） |
+| `result` | `_handle_result()` | Round 结束结果回调 |
 | 其他 | 返回 400 | 未知 mode |
 
 所有请求和响应都会记录完整 JSON 到日志（`[higo_request]` / `[higo_response]`）。
@@ -75,22 +76,38 @@ engine/
    └─ 返回 memory_text（可能为空）
 3. 若 memory_text 非空：
    └─ 构造 memory_message(role="user", content=memory_text)
-   └─ 调用 _build_messages(original, memory_message) 插入到倒数第1条 user 之前
+   └─ 调用 _build_messages(original, memory_message) 插入到第一个 user 之前
 4. 若 memory_text 为空：
    └─ 直接返回原始消息列表（不注入）
-5. 返回 TransformResponse { ok, result { request { messages }, debug { source } }, summary }
+5. 返回 TransformResponse { ok, result { request { messages }, pluginContext }, summary }
 ```
 
 #### 消息插入规则 `_build_messages()`
 
-记忆消息必须插入到**最后一条 user 消息之前**，确保最后一条消息仍然是当前用户输入。
+记忆消息插入到**第一个 user 消息之前**。在 Higo V2 的消息结构中，第一个 user 通常是 context environment，最后一个 user 是 current user，因此该插入方式既能让记忆位于上下文前，也能确保最后一条 user 仍然是当前用户输入。
 
 ```
-Original:  [0]system [1]assistant [2]user(context) [3]user(current)
-After:     [0]system [1]assistant [2]user(context) [3]user(memory) [4]user(current)
+Original:  [0]system [1]user(context) [2]user(current)
+After:     [0]system [1]user(memory) [2]user(context) [3]user(current)
 ```
 
-实现逻辑：先扫描找到最后一个 `role="user"` 的索引，再遍历插入。
+实现逻辑：先扫描找到第一个 `role="user"` 的索引，再遍历插入。若没有 user 消息，则将 memory 追加到末尾。
+
+### 3.4 Result 模式
+
+`_handle_result()` 负责处理 Higo 在 round 结束后的回调：
+
+```
+1. 从 request.session.sessionId 读取 session ID
+2. 从 request.round 读取 roundId/status
+3. 将 message.sections 交给 memory_engine.capture_round_result()
+   └─ type="content" 保存为 assistant 文本消息
+   └─ type="tool" 保存为 tool part
+4. 异步触发 _maybe_commit()
+5. 返回 ResultResponse { ok, summary, ack { roundId, stored, memoryRevision } }
+```
+
+`roundId` 在 `capture_round_result()` 中用于幂等去重，避免同一 round 重复回调时重复写入 OpenViking。
 
 ---
 
@@ -134,44 +151,28 @@ Step 5: Async commit（异步提交）
 
 仅在 `auto_capture=True` 时执行。
 
-**核心策略：只捕获当前轮次消息**，避免 Higo 无状态 transform 导致的重复追加。
+**核心策略：transform 只捕获当前 user 输入**，assistant 回复和 tool 结果由 `result` 回调捕获。
 
 消息分类：
 
 | 消息角色 | 处理方式 |
 |---------|---------|
 | `system` | 不单独保存，合并到最后一条 user 的首个 text part |
-| `assistant` | 只保存**最近一条**，其余跳过 |
+| `assistant` | 跳过，交由 `result` 回调捕获 |
 | `user`（倒数第2条及以前） | 跳过（context env） |
 | `user`（最后一条） | 保存为 current user |
 
-**Capture Decision 过滤**：
-
-每条待捕获消息都经过 `get_capture_decision()` 判断：
-
-1. 先经过 `sanitize_user_text_for_capture()` 清理
-2. 空文本 → 拒绝（reason: `empty_text` 或 `injected_memory_context_only`）
-3. 长度过滤：
-   - 紧凑后长度：CJK ≥4，Latin ≥10
-   - 原始长度 ≤ `capture_max_length`（默认 8192）
-4. Command 过滤：`/^[a-z0-9_-]{1,64}\b` → 拒绝
-5. Non-content 过滤：纯标点/符号/空白 → 拒绝
-6. Subagent Context 过滤：`[Subagent Context]` 开头 → 拒绝
-7. Question-only 过滤：纯问题（不含记忆意图）→ 拒绝
-8. Mode 分支：
-   - `semantic` → 通过（默认）
-   - `keyword` → 需匹配 7 个 MEMORY_TRIGGERS 正则之一才通过
-
-**Assistant 消息存储**：
-- 通过 `message_to_ov_parts()` 转为 OV parts 格式
-- text part 经过 `sanitize_user_text_for_capture()`
-- 调用 `client.add_session_message(role="assistant", ...)`
+当前 `_capture_messages()` 不调用 `get_capture_decision()`；捕获前只对 text part 执行 `sanitize_user_text_for_capture()`，若清理后仍有文本则写入 OpenViking。`capture_mode`、`capture_max_length` 和 `get_capture_decision()` 目前是可复用的工具能力，但不在当前 transform 捕获链路中生效。
 
 **User 消息存储**：
 - 通过 `message_to_ov_parts()` 转为 OV parts
 - 若存在 system 消息，将其内容合并到首个 text part：`[system] {system_text}\n\n{user_text}`
 - text part 经过 `sanitize_user_text_for_capture()`
 - 调用 `client.add_session_message(role="user", ...)`
+
+**Result 消息存储**：
+- `type="content"`：清理后调用 `client.add_session_message(role="assistant", role_id="assistant", ...)`
+- `type="tool"`：构造 `{type:"tool", tool_id, tool_name, tool_input, tool_output}`，以 `role="user", role_id="user"` 写入
 
 **Agent ID**：调用 `self._resolve_agent_id(session_id)`，通过 `AgentResolver` 解析：
 - 从 `sessionId` 中提取 `agent:xxx:` 前缀中的 agentId
@@ -280,13 +281,15 @@ Metadata keys 检测集合：`session, sessionid, sessionkey, conversationid, ch
 
 ### 5.2 Capture Decision `get_capture_decision()`
 
+该函数位于 `text_utils.py`，当前实现可用，但 `OpenVikingMemoryEngine` 的 transform/result 捕获链路没有调用它。下面规则用于后续接入捕获决策时参考。
+
 返回结构：`{ should_capture: bool, reason: str, normalized_text: str }`
 
 **过滤规则执行顺序**：
 
 1. **Empty** → `empty_text` / `injected_memory_context_only`
 2. **Length** → `length_out_of_range`
-   - CJK 紧凑长度 ≥ 4，Latin ≥ 10
+   - CJK 文本最小长度为 0，Latin 文本最小长度为 10
    - 原始长度 ≤ `capture_max_length`
 3. **Command** → `command_text`
 4. **Non-content** → `non_content_text`
@@ -423,8 +426,10 @@ openviking: diag {"ts": 1716633600000, "stage": "...", "sessionId": "...", "data
 | `generate_memory_entry` | `generate_memory` 开头 | sessionId, ovSessionId, msg_count, auto_capture, auto_recall |
 | `generate_memory_skip` | bypass 时 | reason: session_bypassed |
 | `generate_memory_complete` | `generate_memory` 结尾 | total_time, memory_text_length |
-| `capture_classified` | `_capture_messages` 分类后 | system, assistant_total, user_total, current_assistant, current_user, context_env |
+| `capture_classified` | `_capture_messages` 分类后 | system, user_total, current_user, context_env |
 | `capture_result` | `_capture_messages` 结尾 | total_stored, agent_id |
+| `capture_round_result_entry` | `capture_round_result` 开头 | sessionId, roundId, section_count |
+| `capture_round_result_complete` | `capture_round_result` 结尾 | captured, agent_id, roundId |
 | `commit_triggered` | `_maybe_commit` 触发 commit 时 | pending_tokens, threshold, status, archived, task_id |
 | `commit_skipped` | `_maybe_commit` 跳过时 | pending_tokens, threshold, reason |
 | `commit_error` | `_maybe_commit` 异常时 | error |
@@ -542,23 +547,24 @@ X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
 
 ## 12. 关键边界与注意事项
 
-### 12.1 重复 Capture 问题
+### 12.1 Transform/Result 捕获边界
 
-Higo 协议无 `prePromptMessageCount`，引擎采用**启发式策略**：只 capture 最近一条 assistant + 最后一条 user。这意味着：
-- 若 Higo 传入的消息列表包含多轮历史 assistant，旧轮次的 assistant 不会被 capture
-- 这是当前协议约束下的最优近似方案
+Higo V2 的 `transform` 请求只包含当前 round 构建 LLM 请求所需的消息，因此当前实现：
+- 在 `transform` 中只捕获最后一条 user 作为真实用户输入
+- 在 `result` 中捕获 assistant 文本和 tool 结果
+- 用 `roundId` 对 result 回调做幂等去重
 
 ### 12.2 Session ID 映射变更影响
 
 启用 `session_to_ov_id()` 后，非 UUID 的 sessionId 会映射为 sha256 哈希值。已有 OV session 数据（使用原始 sessionId 作为 key）将**不可见**。如需迁移，需手动将旧 session 数据关联到新 ID。
 
-### 12.3 结构化 Tool 消息限制
+### 12.3 结构化 Tool 消息来源
 
-Higo `Message` 模型只有 `{role, content}` 字符串字段，无法传递 `toolCallId`、`toolName`、`toolInput` 等结构化信息。因此当前实现中 tool 消息仅保存为 `{type: "tool", tool_output: content}`，丢失了 tool 元数据。
+Transform 阶段的 `Message` 模型只有 `{role, content}` 字符串字段，不承载 tool 元数据。Tool 信息来自 V2 `result.message.sections`，当前实现会读取 `toolCallId`、`toolname`、`toolargs`、`toolrsp` 并写入 OpenViking tool part。
 
-### 12.4 Capture Decision 的 `keyword` 模式风险
+### 12.4 Capture Decision 尚未接入
 
-`keyword` 模式可能漏掉不含 trigger 但语义有价值的输入。建议生产环境使用默认的 `semantic` 模式。
+`get_capture_decision()` 和 `capture_mode` 已存在，但当前捕获链路尚未调用。生产行为以 `sanitize_user_text_for_capture()` 后是否仍有可写入 parts 为准。
 
 ### 12.5 Token 预算估算
 

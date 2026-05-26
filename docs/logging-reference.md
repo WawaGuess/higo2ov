@@ -7,17 +7,22 @@
 ```
 main.py                     # Higo 协议入口层
 ├── [handle]                # 收到 Higo 请求
+├── [higo_request]          # 完整 Higo 请求体
+├── [higo_response]         # 完整返回体
 ├── [probe]                 # probe 模式处理
-└── [transform]             # transform 模式处理
+├── [transform]             # transform 模式处理
+└── [result]                # result 回调处理
 
 engine/openviking_engine.py # 业务逻辑层
 ├── [generate_memory]       # 核心记忆生成流程
 ├── [capture]               # 消息捕获到 OpenViking
+├── [capture_result]        # result.sections 捕获到 OpenViking
 ├── [recall]                # 记忆搜索与后处理
 ├── [safe_find]             # 单次搜索请求包装
 ├── [assemble]              # 记忆文本组装
 ├── [commit_check]          # commit 阈值检查
-└── [commit]                # commit 触发执行
+├── [commit]                # commit 触发执行
+└── [compact]               # /compact 强制归档
 
 engine/openviking_client.py # HTTP 客户端层
 ├── [ov_request]            # 发出 HTTP 请求
@@ -33,9 +38,12 @@ engine/openviking_client.py # HTTP 客户端层
 
 | 前缀 | 来源函数 | 含义 | 典型输出示例 |
 |------|---------|------|-------------|
-| `[handle]` | `handle()` | 收到 Higo 的 HTTP 请求，记录请求模式 | `mode=probe sessionId=xxx` |
+| `[handle]` | `handle()` | 收到 Higo 的 HTTP 请求，记录请求模式；当前只读取顶层 `sessionId`，V2 请求通常显示 `unknown` | `mode=probe sessionId=unknown` |
+| `[higo_request]` | `handle()` | 完整请求 JSON | `{...}` |
+| `[higo_response]` | `handle()` | 完整响应 JSON | `{...}` |
 | `[probe]` | `_handle_probe()` | probe 模式处理过程 | `sessionId=xxx timestamp=...` / `OpenViking health ok: {...}` |
-| `[transform]` | `_handle_transform()` | transform 模式处理过程 | `sessionId=xxx anchor=seq/subSeq msg_count=N modelTokens=N` |
+| `[transform]` | `_handle_transform()` | transform 模式处理过程；日志字段名仍叫 `anchor`，实际值为 `round.seq/0` | `sessionId=xxx anchor=1/0 msg_count=N modelTokens=N` |
+| `[result]` | `_handle_result()` | round 结束回调处理过程 | `sessionId=xxx roundId=xxx status=completed sections=N errors=0` / `complete ... captured=N` |
 
 **transform 子日志**：
 - `original_msg[N]` — 原始输入消息的角色和内容长度
@@ -51,12 +59,14 @@ engine/openviking_client.py # HTTP 客户端层
 | 前缀 | 来源函数 | 含义 | 典型输出示例 |
 |------|---------|------|-------------|
 | `[generate_memory]` | `generate_memory()` | 核心记忆生成入口，记录整体耗时 | `start sessionId=xxx msg_count=N` / `capture done in 0.XXXs` / `complete total_time=0.XXXs` |
-| `[capture]` | `_capture_messages()` | 将 Higo 消息追加到 OpenViking session | `sessionId=xxx role=user parts=N` / `total captured=N/N` |
+| `[capture]` | `_capture_messages()` | transform 阶段将当前 user 消息追加到 OpenViking session | `stored current_user ovSessionId=xxx parts=N system_merged=true` / `total stored=N` |
+| `[capture_result]` | `capture_round_result()` | result 阶段将 assistant 文本和 tool 结果追加到 OpenViking session | `stored assistant ovSessionId=xxx` / `stored tool result ovSessionId=xxx tool=...` / `total stored=N roundId=...` |
 | `[recall]` | `_recall_memories()` | 并行搜索 user/agent 记忆并后处理 | `query='...' limit=N threshold=X.X` / `raw=N after dedup=N after leaf=N after threshold=N after rerank=N` |
 | `[safe_find]` | `_safe_find()` | 单次语义搜索请求（带异常捕获） | `uri=viking://user/memories returned=N` / `error for ...: ...` |
 | `[assemble]` | `_assemble_memory_text()` | 将上下文和记忆组装为注入文本 | `overview=True/False abstracts=N memories=N text_len=N` |
-| `[commit_check]` | `_maybe_commit()` | 检查 pending_tokens 是否超过阈值 | `sessionId=xxx pending_tokens=N threshold=N` |
-| `[commit]` | `_maybe_commit()` | 触发或跳过 session commit | `triggering sessionId=xxx ...` / `skipped for sessionId=xxx` |
+| `[commit_check]` | `_maybe_commit()` | 检查 pending_tokens 是否超过阈值 | `ovSessionId=xxx pending_tokens=N threshold=N` |
+| `[commit]` | `_maybe_commit()` | 触发或跳过 session commit | `triggering ovSessionId=xxx ...` / `skipped for ovSessionId=xxx` |
+| `[compact]` | `compact()` | 强制归档处理过程 | `committing ovSessionId=xxx (wait=true)` / `committed ... archived=true memories=N` |
 
 ---
 
@@ -99,6 +109,13 @@ engine/openviking_client.py # HTTP 客户端层
 - `[commit_check] pending_tokens=N threshold=N` — 检查 pending_tokens 是否超过阈值
 - `[commit] triggering ...` — commit 已触发，但可能异步执行中
 - `[commit] skipped ...` — pending_tokens 未达阈值，不会触发
+
+### result 回调未写入 assistant/tool
+
+查看 `[result]` 和 `[capture_result]` 日志：
+- `[result] ... sections=0` — Higo 没有传入 sections，higo2ov 不会写入内容
+- `[capture_result] roundId=... already processed` — 同一个 roundId 已处理过，幂等逻辑跳过
+- `[capture_result] total stored=0` — sections 可能为空、content 清理后为空，或 OpenViking 写入失败
 
 ### 性能问题
 

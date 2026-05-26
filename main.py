@@ -6,7 +6,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from models import (
-    DebugInfo,
     EngineInfo,
     Message,
     ProbeRequest,
@@ -86,8 +85,7 @@ async def compact(request: Request):
 
 async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
     """Probe: check OpenViking connectivity in addition to local health."""
-    # Prefer new V2 session.sessionId, fall back to legacy sessionId
-    sid = request.session.sessionId if request.session else request.sessionId
+    sid = request.session.sessionId if request.session else "unknown"
     logger.info(
         "[probe] sessionId=%s timestamp=%s",
         sid,
@@ -113,19 +111,10 @@ async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
 async def _handle_transform(
     request: TransformRequest,
 ) -> TransformResponse:
-    # Prefer new V2 fields, fall back to legacy
-    sid = request.session.sessionId if request.session else request.sessionId
+    sid = request.session.sessionId if request.session else "unknown"
     original_messages = request.request.messages
-    anchor_seq = (
-        request.round.seq
-        if request.round
-        else (request.anchor.seq if request.anchor else 0)
-    )
-    anchor_sub = (
-        0
-        if request.round
-        else (request.anchor.subSeq if request.anchor else 0)
-    )
+    anchor_seq = request.round.seq if request.round else 0
+    anchor_sub = 0
     model_tokens = (
         request.meta.modelContextWindowTokens
         if request.meta
@@ -184,7 +173,6 @@ async def _handle_transform(
         ok=True,
         result=TransformResult(
             request={"messages": new_messages},
-            debug=DebugInfo(source=ENGINE_NAME),
             pluginContext={"memoryRevision": "higo-ov-r1"},
         ),
         summary="transform ok",
@@ -247,45 +235,32 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
 def _build_messages(
     original: list[Message], memory_message: Message
 ) -> list[Message]:
-    """Construct new message list without modifying or reordering original messages.
+    """Construct new message list with memory injected before the first user message.
 
-    The memory message is inserted immediately before the last user message
-    (the current user message), preserving all original message order.
-
-    Original format (per Higo protocol):
+    New protocol format:
         [0] system
-        [1] assistant (previous turn reply, optional)
+        [1] user (memory)             <- injected
         [2] user (context environment)
-        [3] user (current user message)
-
-    After insertion:
-        [0] system                    <- preserved
-        [1] assistant (if present)    <- preserved
-        [2] user (context env)        <- preserved
-        [3] user (memory)             <- inserted
-        [4] user (current user)       <- preserved, must be last user
+        [3] user (current user message) <- must be last
     """
     if not original:
         return [memory_message]
 
-    result: list[Message] = []
-    inserted = False
-
-    # Find the index of the last user message
-    last_user_idx = -1
+    # Find the index of the first user message
+    first_user_idx = -1
     for i, msg in enumerate(original):
         if msg.role == "user":
-            last_user_idx = i
+            first_user_idx = i
+            break
 
-    # If no user message found (should not happen), append memory at end
-    if last_user_idx < 0:
+    # If no user message found, append memory at end
+    if first_user_idx < 0:
         return [*original, memory_message]
 
-    # Insert memory before the last user message
+    result: list[Message] = []
     for i, msg in enumerate(original):
-        if i == last_user_idx and not inserted:
+        if i == first_user_idx:
             result.append(memory_message)
-            inserted = True
         result.append(msg)
 
     return result

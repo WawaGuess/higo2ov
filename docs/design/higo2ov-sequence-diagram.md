@@ -36,17 +36,8 @@ sequenceDiagram
 
     P->>P: 去重 → 过滤叶子 → 阈值过滤 → 重排序 → Token预算截断
 
-    P->>OV: GET /api/v1/sessions/{id}
-    Note right of P: 检查 pending_tokens 是否超过阈值
-    OV-->>P: {pending_tokens: 2}
-
-    alt pending_tokens > threshold
-        P->>OV: POST /api/v1/sessions/{id}/commit
-        Note right of P: wait=false（异步归档）
-        OV-->>P: {status, task_id}
-    else 未超过阈值
-        P->>P: 跳过归档
-    end
+    P->>P: create_task(_maybe_commit)
+    Note right of P: 异步检查 pending_tokens，不阻塞响应
 
     P-->>H: 200 OK
     Note left of P: ok: true<br/>summary: "transform ok"<br/>result.request.messages: [system, memory, contextEnv, currentUser]<br/>pluginContext: {memoryRevision: "higo-ov-r1"}
@@ -65,7 +56,7 @@ sequenceDiagram
 
     loop 遍历 sections
         alt type="content"
-            P->>P: sanitize_user_text_for_capture(content)<br/>→ 过滤 <think> / metadata / HEARTBEAT<br/>→ get_capture_decision() 检查长度/命令/纯标点/问题
+            P->>P: sanitize_user_text_for_capture(content)<br/>→ 过滤 <think> / metadata / HEARTBEAT<br/>→ 清理后为空则跳过
             P->>OV: POST /api/v1/sessions/{id}/messages
             Note right of P: role="assistant"<br/>parts: [{type:"text", text:"你好！我是..."}]
             OV-->>P: 200 OK
@@ -76,15 +67,8 @@ sequenceDiagram
         end
     end
 
-    P->>OV: GET /api/v1/sessions/{id}
-    Note right of P: 检查 pending_tokens 是否超过阈值
-    OV-->>P: {pending_tokens: N}
-
-    alt pending_tokens > threshold
-        P->>OV: POST /api/v1/sessions/{id}/commit
-        Note right of P: wait=false（异步归档）
-        OV-->>P: {status, task_id}
-    end
+    P->>P: create_task(_maybe_commit)
+    Note right of P: 异步检查 pending_tokens，不阻塞响应
 
     P-->>H: 200 OK
     Note left of P: ok: true<br/>summary: "result accepted"<br/>ack: {roundId, stored: true}
@@ -103,7 +87,7 @@ sequenceDiagram
 | 1 | Capture user 输入 | `POST /api/v1/sessions/{id}/messages` |
 | 2 | 获取 session 上下文 | `GET /api/v1/sessions/{id}/context` |
 | 3 | 搜索相关记忆（并行） | `POST /api/v1/search/find` × 2 |
-| 4 | 检查并触发归档 | `GET /api/v1/sessions/{id}` → `POST /api/v1/sessions/{id}/commit` |
+| 4 | 异步检查并触发归档 | `GET /api/v1/sessions/{id}` → `POST /api/v1/sessions/{id}/commit` |
 
 **响应关键**：`result.request.messages` 必须保留 system/contextEnv/currentUser 的相对顺序，最后一条 user 必须是 currentUser。
 
@@ -113,16 +97,15 @@ sequenceDiagram
 |------|------|--------|
 | 1 | 解析 sections，提取 assistant 文本 | 本地处理 |
 | 2 | 清洗（过滤 think/metadata/HEARTBEAT） | `sanitize_user_text_for_capture()` |
-| 3 | 决策过滤（长度/命令/纯标点/问题） | `get_capture_decision()` |
-| 4 | 存入 assistant 回复 | `POST /api/v1/sessions/{id}/messages` (role=assistant) |
-| 5 | 存入 tool 结果 | `POST /api/v1/sessions/{id}/messages` (role=user, type=tool) |
-| 6 | 检查并触发归档 | `GET /api/v1/sessions/{id}` → `POST /api/v1/sessions/{id}/commit` |
+| 3 | 空内容跳过，否则存入 assistant 回复 | `POST /api/v1/sessions/{id}/messages` (role=assistant) |
+| 4 | 存入 tool 结果 | `POST /api/v1/sessions/{id}/messages` (role=user, type=tool) |
+| 5 | 异步检查并触发归档 | `GET /api/v1/sessions/{id}` → `POST /api/v1/sessions/{id}/commit` |
 
 **幂等性**：`capture_round_result` 以 `roundId` 为键做去重，同一 roundId 重复调用不会重复写入。
 
 ### 异步归档（_maybe_commit）
 
-Transform 和 Result 阶段都会触发 `_maybe_commit`：
+Transform 和 Result 阶段都会异步触发 `_maybe_commit`：
 - 获取 session 的 `pending_tokens`
 - 如果超过 `commitTokenThreshold`，调用 `commit(wait=false)`
 - OV 返回 `task_id`，Phase 2（记忆提取）异步执行

@@ -7,11 +7,6 @@ class Message(BaseModel):
     content: str
 
 
-class Anchor(BaseModel):
-    seq: int
-    subSeq: int
-
-
 class Session(BaseModel):
     sessionId: str
     contextPath: str | None = None
@@ -38,7 +33,6 @@ class Meta(BaseModel):
 
 class BaseRequest(BaseModel):
     mode: Literal["probe", "transform", "result"]
-    sessionId: str | None = None
 
 
 class ProbeRequest(BaseModel):
@@ -46,7 +40,6 @@ class ProbeRequest(BaseModel):
     protocolVersion: str | None = None
     source: str
     session: Session | None = None
-    sessionId: str | None = None
     timestamp: str
 
 
@@ -55,10 +48,7 @@ class TransformRequest(BaseModel):
     protocolVersion: str | None = None
     source: str | None = None
     session: Session | None = None
-    sessionId: str | None = None
-    contextPath: str | None = None
     round: Round | None = None
-    anchor: Anchor | None = None
     request: RequestPayload
     meta: Meta | None = None
 
@@ -74,17 +64,12 @@ class ProbeResponse(BaseModel):
     engine: EngineInfo
 
 
-class DebugInfo(BaseModel):
-    source: str
-
-
 class TransformResultRequest(BaseModel):
     messages: list[Message]
 
 
 class TransformResult(BaseModel):
     request: TransformResultRequest
-    debug: DebugInfo
     pluginContext: dict | None = None
 
 

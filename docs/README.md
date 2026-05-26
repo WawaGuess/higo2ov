@@ -110,5 +110,13 @@ docs/
 | `README.md` | Active | 文档目录总规范 |
 | `architecture/README.md` | Active | 架构文档目录规范 |
 | `design/README.md` | Active | 设计文档目录规范 |
+| `design/end-to-end-deployment-guide.md` | Active | 端到端部署与对接指南 |
+| `design/higo-openviking-bridge-implementation.md` | Active | 当前代码逻辑实现文档 |
+| `design/higo2ov-sequence-diagram.md` | Active | Higo2OV 时序图与协议交互 |
 | `legacy/README.md` | Active | 历史文档目录规范 |
+| `logging-reference.md` | Active | 日志前缀与排查参考 |
+| `openclaw-plugin-feature-comparison.md` | Active | higo2ov 与 OpenClaw-Plugin 当前能力对比 |
 | `proposals/README.md` | Active | 提案文档目录规范 |
+| `proposals/higo-v2-protocol-adaptation-plan.md` | Proposal | Higo V2 协议适配方案记录 |
+| `proposals/message-capture-conversion-plan.md` | Proposal | Higo 消息捕获转换方案记录 |
+| `proposals/openviking-bridge-implementation-plan.md` | Proposal | OpenViking 桥接实现方案记录 |
