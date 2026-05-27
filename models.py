@@ -32,7 +32,7 @@ class Meta(BaseModel):
 
 
 class BaseRequest(BaseModel):
-    mode: Literal["probe", "transform", "result"]
+    mode: Literal["probe", "transform", "result", "memory_query"]
 
 
 class ProbeRequest(BaseModel):
@@ -141,3 +141,25 @@ class ResultResponse(BaseModel):
     ok: bool = True
     summary: str
     ack: ResultAck
+
+
+class Anchor(BaseModel):
+    seq: int
+    subSeq: int
+
+
+class MemoryQueryRequest(BaseModel):
+    mode: Literal["memory_query"] = "memory_query"
+    action: Literal["help", "query"]
+    protocolVersion: str | None = None
+    source: str | None = None
+    session: Session | None = None
+    anchor: Anchor | None = None
+    query: dict | None = None
+
+
+class MemoryQueryResponse(BaseModel):
+    ok: bool = True
+    summary: str
+    result: dict | None = None
+    engine: EngineInfo | None = None

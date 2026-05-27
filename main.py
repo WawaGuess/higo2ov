@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 
 from models import (
     EngineInfo,
+    MemoryQueryRequest,
+    MemoryQueryResponse,
     Message,
     ProbeRequest,
     ProbeResponse,
@@ -52,6 +54,9 @@ async def handle(request: Request):
     elif mode == "result":
         result_req = ResultRequest.model_validate(body)
         resp = await _handle_result(result_req)
+    elif mode == "memory_query":
+        memory_query_req = MemoryQueryRequest.model_validate(body)
+        resp = await _handle_memory_query(memory_query_req)
     else:
         logger.error("[handle] unknown mode: %s", mode)
         resp = JSONResponse(
@@ -229,6 +234,21 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
             stored=True,
             memoryRevision="higo-ov-r1",
         ),
+    )
+
+
+async def _handle_memory_query(
+    request: MemoryQueryRequest,
+) -> MemoryQueryResponse:
+    sid = request.session.sessionId if request.session else "unknown"
+    logger.info(
+        "[memory_query] sessionId=%s action=%s", sid, request.action
+    )
+    return MemoryQueryResponse(
+        ok=False,
+        summary="当前功能不可用，暂不支持",
+        result={},
+        engine=EngineInfo(name=ENGINE_NAME, version=ENGINE_VERSION),
     )
 
 

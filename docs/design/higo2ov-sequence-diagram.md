@@ -103,6 +103,15 @@ sequenceDiagram
 
 **幂等性**：`capture_round_result` 以 `roundId` 为键做去重，同一 roundId 重复调用不会重复写入。
 
+### Memory Query 阶段（独立调用）
+
+`mode=memory_query` 提供记忆查询工具能力，当前为**占位实现**。
+
+| action | 说明 | 当前行为 |
+|--------|------|---------|
+| `help` | 返回查询语法帮助 | 返回 `ok=false, summary="当前功能不可用，暂不支持"` |
+| `query` | 执行记忆查询 | 同上 |
+
 ### 异步归档（_maybe_commit）
 
 Transform 和 Result 阶段都会异步触发 `_maybe_commit`：

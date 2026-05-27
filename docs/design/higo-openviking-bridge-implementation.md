@@ -11,6 +11,7 @@
 1. `transform` 阶段捕获当前 user 输入，并从 OpenViking 召回相关记忆
 2. 将记忆文本注入到消息列表中，供 LLM 参考
 3. `result` 阶段捕获 assistant 回复和 tool 结果
+4. `memory_query` 阶段提供记忆查询工具能力（占位实现）
 
 同时提供 `probe` 健康检查和一个独立的 `/compact` 强制归档端点。
 
@@ -54,6 +55,7 @@ engine/
 | `probe` | `_handle_probe()` | 健康检查 |
 | `transform` | `_handle_transform()` | 消息转换（核心） |
 | `result` | `_handle_result()` | Round 结束结果回调 |
+| `memory_query` | `_handle_memory_query()` | 记忆查询工具（占位） |
 | 其他 | 返回 400 | 未知 mode |
 
 所有请求和响应都会记录完整 JSON 到日志（`[higo_request]` / `[higo_response]`）。
@@ -108,6 +110,54 @@ After:     [0]system [1]user(memory) [2]user(context) [3]user(current)
 ```
 
 `roundId` 在 `capture_round_result()` 中用于幂等去重，避免同一 round 重复回调时重复写入 OpenViking。
+
+### 3.5 Memory Query 模式
+
+`_handle_memory_query()` 是记忆查询工具端点，目前为**占位实现**。
+
+支持两种 action：
+
+| action | 说明 |
+|--------|------|
+| `help` | 返回查询语法帮助信息 |
+| `query` | 执行记忆查询 |
+
+**当前行为**：无论 action 为何值，均返回：
+
+```json
+{
+  "ok": false,
+  "summary": "当前功能不可用，暂不支持",
+  "result": {},
+  "engine": {
+    "name": "higo-openviking-bridge",
+    "version": "1.1.0"
+  }
+}
+```
+
+**请求模型**（`models.py:151-158`）：
+
+```python
+class MemoryQueryRequest(BaseModel):
+    mode: Literal["memory_query"] = "memory_query"
+    action: Literal["help", "query"]
+    protocolVersion: str | None = None
+    source: str | None = None
+    session: Session | None = None
+    anchor: Anchor | None = None      # { seq, subSeq }
+    query: dict | None = None         # action=query 时携带
+```
+
+**响应模型**（`models.py:161-165`）：
+
+```python
+class MemoryQueryResponse(BaseModel):
+    ok: bool = True
+    summary: str
+    result: dict | None = None
+    engine: EngineInfo | None = None
+```
 
 ---
 

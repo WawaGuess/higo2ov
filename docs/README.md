@@ -111,7 +111,7 @@ docs/
 | `architecture/README.md` | Active | 架构文档目录规范 |
 | `design/README.md` | Active | 设计文档目录规范 |
 | `design/end-to-end-deployment-guide.md` | Active | 端到端部署与对接指南 |
-| `design/higo-openviking-bridge-implementation.md` | Active | 当前代码逻辑实现文档 |
+| `design/higo-openviking-bridge-implementation.md` | Active | 当前代码逻辑实现文档（已含 memory_query 占位） |
 | `design/higo2ov-sequence-diagram.md` | Active | Higo2OV 时序图与协议交互 |
 | `legacy/README.md` | Active | 历史文档目录规范 |
 | `logging-reference.md` | Active | 日志前缀与排查参考 |
