@@ -21,18 +21,17 @@ _MAX_TURNS_PER_SESSION = 50
 try:
     import tiktoken
 
-    _HAS_TIKTOKEN = True
-except ImportError:
-    _HAS_TIKTOKEN = False
+    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
 
 
 def _count_tokens(text: str) -> int:
     if not text:
         return 0
-    if _HAS_TIKTOKEN:
+    if _TIKTOKEN_ENC is not None:
         try:
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
+            return len(_TIKTOKEN_ENC.encode(text))
         except Exception:
             pass
     total = 0

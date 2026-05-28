@@ -57,7 +57,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         return self._agent_resolver.resolve(session_id)
 
     async def generate_memory(
-        self, session_id: str, messages: list[dict]
+        self, session_id: str, messages: list[dict], model_context_tokens: int = 0
     ) -> str:
         """Core entry called by main.py's transform handler.
 
@@ -154,7 +154,24 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 )
 
                 # 4. Assemble memory text
-                memory_text = self._assemble_memory_text(context, memories)
+                effective_budget = self.config.recall_token_budget
+                if model_context_tokens > 0:
+                    messages_tokens = sum(
+                        len(m.get("content", "")) // 4 for m in messages
+                    )
+                    reserved = 2048
+                    available = model_context_tokens - messages_tokens - reserved
+                    effective_budget = min(effective_budget, max(0, available))
+                    logger.info(
+                        "[generate_memory] token_budget adjusted: config=%s model=%s messages=%s reserved=%s effective=%s",
+                        self.config.recall_token_budget,
+                        model_context_tokens,
+                        messages_tokens,
+                        reserved,
+                        effective_budget,
+                    )
+
+                memory_text = self._assemble_memory_text(memories, effective_budget)
                 logger.info(
                     "[generate_memory] assembled memory_text length=%s",
                     len(memory_text) if memory_text else 0,
@@ -372,43 +389,20 @@ class OpenVikingMemoryEngine(MemoryEngine):
             return {}
 
     def _assemble_memory_text(
-        self, context: dict, memories: list[dict]
+        self, memories: list[dict], token_budget: int
     ) -> str:
         """Assemble the memory text block for Higo injection."""
-        lines: list[str] = []
+        if not memories:
+            return ""
 
-        # Session history summary
-        overview = context.get("latest_archive_overview", "")
-        if overview:
-            lines.append("[Session History Summary]")
-            lines.append(overview)
-            lines.append("")
+        lines = ["<relevant-memories>"]
+        memory_lines = build_memory_lines_with_budget(memories, token_budget)
+        lines.extend(memory_lines)
+        lines.append("</relevant-memories>")
 
-        # Archive index
-        abstracts = context.get("pre_archive_abstracts", [])
-        if abstracts:
-            lines.append("[Archive Index]")
-            for ab in abstracts:
-                archive_id = ab.get("archive_id", "unknown")
-                abstract = ab.get("abstract", "")
-                lines.append(f"- {archive_id}: {abstract}")
-            lines.append("")
-
-        # Relevant memories (with token budget)
-        if memories:
-            lines.append("<relevant-memories>")
-            memory_lines = build_memory_lines_with_budget(
-                memories, self.config.recall_token_budget
-            )
-            lines.extend(memory_lines)
-            lines.append("</relevant-memories>")
-            lines.append("")
-
-        text = "\n".join(lines).strip()
+        text = "\n".join(lines)
         logger.info(
-            "[assemble] overview=%s abstracts=%s memories=%s text_len=%s",
-            bool(overview),
-            len(abstracts),
+            "[assemble] memories=%s text_len=%s",
             len(memories),
             len(text),
         )

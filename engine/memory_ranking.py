@@ -2,6 +2,8 @@
 
 import re
 
+from monitor.collector import _count_tokens
+
 
 def deduplicate_by_uri(results: list[dict]) -> list[dict]:
     """Deduplicate by URI, keeping the highest-scored entry."""
@@ -90,9 +92,11 @@ def build_memory_lines_with_budget(
     """Build memory lines within a token budget.
 
     The first memory is always included even if it exceeds budget (bounded overshoot).
-    Uses a rough heuristic of ~4 chars per token.
+    Uses _count_tokens for accurate token estimation (tiktoken when available).
     """
     lines: list[str] = []
+    running_text = ""
+
     for i, r in enumerate(results):
         category = r.get("category", "memory")
         content = r.get("abstract") or r.get("overview") or ""
@@ -100,9 +104,11 @@ def build_memory_lines_with_budget(
         line = f"- [{category}] {content} ({score:.0%})"
         if i == 0:
             lines.append(line)
+            running_text = line
             continue
-        # Rough estimation: ~4 chars per token
-        estimated_tokens = len("\n".join(lines)) // 4
-        if estimated_tokens < token_budget:
+        # Check total *after* adding this line to avoid a single oversized entry blowing the budget.
+        candidate = running_text + "\n" + line
+        if _count_tokens(candidate) <= token_budget:
             lines.append(line)
+            running_text = candidate
     return lines

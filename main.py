@@ -147,6 +147,7 @@ async def _handle_transform(
     memory_text = await memory_engine.generate_memory(
         sid,
         [m.model_dump() for m in original_messages],
+        model_context_tokens=model_tokens,
     )
     logger.info(
         "[transform] memory_text generated, length=%s",
