@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Higo2OV Monitor - Conversation Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            text-align: center;
+            padding: 30px 0;
+            border-bottom: 1px solid #334155;
+            margin-bottom: 24px;
+        }
+        header h1 {
+            font-size: 28px;
+            font-weight: 600;
+            color: #f8fafc;
+            margin-bottom: 8px;
+        }
+        header p {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+        .refresh-info {
+            text-align: center;
+            color: #64748b;
+            font-size: 12px;
+            margin-bottom: 16px;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 900px) {
+            .layout { grid-template-columns: 1fr; }
+        }
+        .sidebar {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            height: fit-content;
+            max-height: calc(100vh - 180px);
+            overflow-y: auto;
+        }
+        .sidebar h3 {
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .session-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .session-item {
+            padding: 10px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+        .session-item:hover {
+            background: #334155;
+        }
+        .session-item.active {
+            background: #2563eb;
+            border-color: #3b82f6;
+        }
+        .session-item .session-time {
+            font-size: 11px;
+            color: #94a3b8;
+            margin-bottom: 2px;
+        }
+        .session-item.active .session-time {
+            color: #bfdbfe;
+        }
+        .session-item .session-id {
+            font-size: 11px;
+            color: #64748b;
+            font-family: monospace;
+        }
+        .session-item.active .session-id {
+            color: #93c5fd;
+        }
+        .session-item .session-stats {
+            font-size: 11px;
+            color: #64748b;
+            margin-top: 2px;
+        }
+        .session-item.active .session-stats {
+            color: #93c5fd;
+        }
+        .main {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+        }
+        .card h2 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #f8fafc;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card h2 .icon {
+            font-size: 18px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .stat-box {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 14px;
+            text-align: center;
+            border: 1px solid #334155;
+        }
+        .stat-box .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #60a5fa;
+        }
+        .stat-box .stat-label {
+            font-size: 12px;
+            color: #94a3b8;
+            margin-top: 4px;
+        }
+        .turn-nav {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .turn-btn {
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .turn-btn:hover {
+            background: #334155;
+        }
+        .turn-btn.active {
+            background: #2563eb;
+            color: #fff;
+            border-color: #3b82f6;
+        }
+        .chart-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 900px) {
+            .chart-row { grid-template-columns: 1fr; }
+        }
+        .chart-container {
+            position: relative;
+            height: 280px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .chart-legend {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 12px;
+            font-size: 12px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        .legend-label {
+            color: #e2e8f0;
+        }
+        .legend-value {
+            color: #94a3b8;
+            margin-left: auto;
+        }
+        .chunk-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .chunk-table th {
+            text-align: left;
+            padding: 10px 12px;
+            background: #0f172a;
+            color: #94a3b8;
+            font-weight: 500;
+            border-bottom: 1px solid #334155;
+        }
+        .chunk-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #334155;
+            vertical-align: top;
+        }
+        .chunk-table tr:hover {
+            background: #252f47;
+        }
+        .chunk-category {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .cat-system { background: #dc2626; color: #fff; }
+        .cat-memory { background: #f59e0b; color: #fff; }
+        .cat-user { background: #16a34a; color: #fff; }
+        .cat-assistant { background: #2563eb; color: #fff; }
+        .cat-tool { background: #9333ea; color: #fff; }
+        .cat-tools { background: #ea580c; color: #fff; }
+        .cat-history { background: #0ea5e9; color: #fff; }
+        .cat-other { background: #64748b; color: #fff; }
+        .token-bar {
+            height: 6px;
+            border-radius: 3px;
+            background: #334155;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+        .token-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+        .content-preview {
+            color: #94a3b8;
+            font-size: 12px;
+            margin-top: 6px;
+            max-height: 60px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            cursor: pointer;
+        }
+        .content-preview.expanded {
+            max-height: none;
+            -webkit-line-clamp: unset;
+            white-space: pre-wrap;
+            background: #0f172a;
+            padding: 8px;
+            border-radius: 6px;
+            margin-top: 6px;
+        }
+        .output-box {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 14px;
+            border: 1px solid #334155;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 13px;
+            line-height: 1.7;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .memory-box {
+            background: #1e3a5f;
+            border-radius: 8px;
+            padding: 14px;
+            border: 1px solid #3b82f6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 13px;
+            line-height: 1.7;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 8px;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #64748b;
+        }
+        .empty-state .icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        .empty-state h3 {
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: #94a3b8;
+        }
+        .toggle-btn {
+            background: #0f172a;
+            border: 1px solid #334155;
+            color: #94a3b8;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
+        .toggle-btn:hover {
+            background: #334155;
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Higo2OV Monitor</h1>
+            <p>Conversation & Token Visualization — 监测 Higo 会话的输入分块与输出</p>
+        </header>
+        <div class="refresh-info" id="refreshInfo">Loading...</div>
+        <div id="app">
+            <div class="empty-state">
+                <div class="icon">&#x1F440;</div>
+                <h3>等待对话数据...</h3>
+                <p>完成一次与 Higo 的对话后，数据将自动显示在这里。</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- State ---
+        let sessions = [];
+        let currentSessionIndex = 0;
+        let currentTurnIndex = 0;
+        let charts = {};
+
+        const CATEGORY_COLORS = {
+            system: '#dc2626',
+            memory: '#f59e0b',
+            user: '#16a34a',
+            history: '#0ea5e9',
+            tools: '#ea580c',
+            other: '#64748b',
+        };
+
+        const CATEGORY_NAMES = {
+            system: 'System Prompt',
+            memory: 'Injected Memory',
+            user: 'User Input',
+            history: 'Conversation History',
+            tools: 'Tools Schema',
+            other: 'Other',
+        };
+
+        // --- API ---
+        async function fetchSessions() {
+            const res = await fetch('/monitor/api/sessions');
+            const data = await res.json();
+            return data.sessions || [];
+        }
+
+        async function fetchSession(sessionId) {
+            const res = await fetch(`/monitor/api/sessions/${sessionId}`);
+            if (res.status !== 200) return null;
+            return await res.json();
+        }
+
+        async function fetchLatestCheckpoint() {
+            const res = await fetch('/monitor/api/sessions');
+            if (res.status !== 200) return null;
+            const data = await res.json();
+            const s = data.sessions || [];
+            const totalIn = s.reduce((sum, sess) => sum + (sess.totals?.total_input_tokens || 0), 0);
+            const totalOut = s.reduce((sum, sess) => sum + (sess.totals?.total_output_tokens || 0), 0);
+            return {
+                session_count: s.length,
+                total_input_tokens: totalIn,
+                total_output_tokens: totalOut,
+                turn_count: s.reduce((sum, sess) => sum + sess.turn_count, 0),
+            };
+        }
+
+        // --- Render ---
+        function renderApp() {
+            const app = document.getElementById('app');
+            if (!sessions.length) {
+                app.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">&#x1F440;</div>
+                        <h3>等待对话数据...</h3>
+                        <p>完成一次与 Higo 的对话后，数据将自动显示在这里。</p>
+                    </div>`;
+                return;
+            }
+            app.innerHTML = `
+                <div class="layout">
+                    <aside class="sidebar">
+                        <h3>会话列表</h3>
+                        <div class="session-list" id="sessionList"></div>
+                    </aside>
+                    <main class="main" id="mainPanel"></main>
+                </div>
+            `;
+            renderSessionList();
+            renderMainPanel();
+        }
+
+        function renderSessionList() {
+            const list = document.getElementById('sessionList');
+            list.innerHTML = sessions.map((session, idx) => {
+                const time = new Date(session.updated_at * 1000).toLocaleString('zh-CN');
+                const isActive = idx === currentSessionIndex;
+                const sid = session.session_id;
+                const shortId = sid.length > 12 ? sid.slice(0, 12) + '...' : sid;
+                return `
+                    <div class="session-item ${isActive ? 'active' : ''}" onclick="selectSession(${idx})">
+                        <div class="session-time">${time}</div>
+                        <div class="session-id">${escapeHtml(shortId)}</div>
+                        <div class="session-stats">
+                            ${session.turn_count} 轮 · ${session.totals?.total_input_tokens?.toLocaleString() || 0} in · ${session.totals?.total_output_tokens?.toLocaleString() || 0} out
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderMainPanel() {
+            const panel = document.getElementById('mainPanel');
+            const session = sessions[currentSessionIndex];
+            if (!session) return;
+
+            // Fetch full session data (with turns)
+            fetchSession(session.session_id).then(fullSession => {
+                if (!fullSession) return;
+                const turns = fullSession.turns || [];
+                if (currentTurnIndex >= turns.length) currentTurnIndex = turns.length - 1;
+                const turn = turns[currentTurnIndex];
+                if (!turn) return;
+
+                const stats = fullSession.session_totals || {};
+                const chunks = turn.chunks || [];
+                const input = turn.input || {};
+                const output = turn.output || {};
+
+                // Aggregate chunks by category for pie chart
+                const catTotals = {};
+                chunks.forEach(c => {
+                    const cat = c.category || 'other';
+                    catTotals[cat] = (catTotals[cat] || 0) + (c.tokens || 0);
+                });
+                const totalInput = Object.values(catTotals).reduce((a, b) => a + b, 0);
+
+                panel.innerHTML = `
+                    <div class="card">
+                        <h2><span class="icon">&#x1F4CA;</span> 统计概览 (Session)</h2>
+                        <div class="stats-grid">
+                            <div class="stat-box">
+                                <div class="stat-value">${stats.turn_count || 0}</div>
+                                <div class="stat-label">对话轮次</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value">${(stats.total_input_tokens || 0).toLocaleString()}</div>
+                                <div class="stat-label">总输入 Token</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value">${(stats.total_output_tokens || 0).toLocaleString()}</div>
+                                <div class="stat-label">总输出 Token</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value">${(stats.total_tokens || 0).toLocaleString()}</div>
+                                <div class="stat-label">总 Token</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2><span class="icon">&#x1F504;</span> 交互轮次选择</h2>
+                        <div class="turn-nav" id="turnNav"></div>
+                    </div>
+
+                    <div class="card">
+                        <h2><span class="icon">&#x1F4C8;</span> 输入 Token 分块占比 — 轮次 #${currentTurnIndex + 1}</h2>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                            <div>
+                                <div class="chart-container">
+                                    <canvas id="tokenChart"></canvas>
+                                </div>
+                            </div>
+                            <div>
+                                <div class="chart-legend" id="chartLegend"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2><span class="icon">&#x1F4DD;</span> 分块详情 — 轮次 #${currentTurnIndex + 1}</h2>
+                        <table class="chunk-table">
+                            <thead>
+                                <tr>
+                                    <th>分块</th>
+                                    <th>类别</th>
+                                    <th>Token 数</th>
+                                    <th>占比</th>
+                                    <th>内容预览</th>
+                                </tr>
+                            </thead>
+                            <tbody id="chunkTableBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="card">
+                        <h2><span class="icon">&#x1F4AC;</span> LLM 输出 — 轮次 #${currentTurnIndex + 1}</h2>
+                        <div class="output-box">${escapeHtml(output.assistant_output || '(无输出内容)')}</div>
+                    </div>
+
+                    <div id="toolCallsPanel"></div>
+
+                    ${input.memory_injected ? `
+                    <div class="card">
+                        <h2><span class="icon">&#x1F9E0;</span> 注入的 Memory — 轮次 #${currentTurnIndex + 1}</h2>
+                        <button class="toggle-btn" onclick="toggleMemory()">显示/隐藏</button>
+                        <div class="memory-box hidden" id="memoryBox">${escapeHtml(input.memory_injected)}</div>
+                    </div>
+                    ` : ''}
+                `;
+
+                renderTurnNav(turns);
+                renderChart('tokenChart', 'chartLegend', catTotals, totalInput);
+                renderChunkTable(chunks, totalInput);
+                renderToolCalls(output.tool_calls || [], currentTurnIndex + 1);
+            });
+        }
+
+        function renderTurnNav(turns) {
+            const nav = document.getElementById('turnNav');
+            if (!nav) return;
+            nav.innerHTML = turns.map((turn, idx) => {
+                const isActive = idx === currentTurnIndex;
+                const query = turn.input?.user_input || '';
+                const label = query.slice(0, 20) + (query.length > 20 ? '...' : '') || `轮次 #${idx + 1}`;
+                return `<button class="turn-btn ${isActive ? 'active' : ''}" onclick="selectTurn(${idx})">
+                    ${escapeHtml(label)} (${(turn.totals?.input_tokens || 0) + (turn.totals?.output_tokens || 0)} tk)
+                </button>`;
+            }).join('');
+        }
+
+        function toggleMemory() {
+            const box = document.getElementById('memoryBox');
+            if (box) box.classList.toggle('hidden');
+        }
+
+        function selectSession(idx) {
+            currentSessionIndex = idx;
+            currentTurnIndex = 0;
+            renderApp();
+        }
+
+        function selectTurn(idx) {
+            currentTurnIndex = idx;
+            renderMainPanel();
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderToolCalls(toolCalls, turnNum) {
+            const panel = document.getElementById('toolCallsPanel');
+            if (!panel) return;
+            if (!toolCalls || toolCalls.length === 0) {
+                panel.innerHTML = '';
+                return;
+            }
+            const items = toolCalls.map((tc, i) => {
+                return `
+                    <div style="background: #0f172a; border-radius: 8px; padding: 12px; margin-bottom: 8px; border: 1px solid #334155;">
+                        <div style="font-size: 12px; color: #60a5fa; margin-bottom: 4px;">#${i+1} ${escapeHtml(tc.toolname || '')}</div>
+                        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 4px;">参数:</div>
+                        <div class="output-box" style="max-height: 150px; font-size: 12px; margin-bottom: 8px;">${escapeHtml(tc.toolargs || '')}</div>
+                        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 4px;">结果:</div>
+                        <div class="output-box" style="max-height: 150px; font-size: 12px;">${escapeHtml(tc.toolrsp || '')}</div>
+                    </div>
+                `;
+            }).join('');
+            panel.innerHTML = `
+                <div class="card">
+                    <h2><span class="icon">&#x2699;</span> Tool 调用 — 轮次 #${turnNum}</h2>
+                    ${items}
+                </div>
+            `;
+        }
+
+        function renderChart(canvasId, legendId, catTotals, totalInput) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+            if (charts[canvasId]) charts[canvasId].destroy();
+
+            const labels = [];
+            const data = [];
+            const colors = [];
+            Object.entries(catTotals).forEach(([cat, tokens]) => {
+                labels.push(CATEGORY_NAMES[cat] || cat);
+                data.push(tokens);
+                colors.push(CATEGORY_COLORS[cat] || '#64748b');
+            });
+
+            if (data.length === 0) {
+                ctx.parentElement.innerHTML = '<p style="color:#64748b">暂无分块数据</p>';
+                return;
+            }
+
+            charts[canvasId] = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels,
+                    datasets: [{
+                        data,
+                        backgroundColor: colors,
+                        borderWidth: 2,
+                        borderColor: '#1e293b',
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    const val = context.raw;
+                                    const pct = totalInput > 0 ? ((val / totalInput) * 100).toFixed(1) : 0;
+                                    return `${val.toLocaleString()} tokens (${pct}%)`;
+                                }
+                            }
+                        }
+                    },
+                    cutout: '55%',
+                }
+            });
+
+            const legendEl = document.getElementById(legendId);
+            if (legendEl) {
+                const items = Object.entries(catTotals)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([cat, tokens]) => {
+                        const pct = totalInput > 0 ? ((tokens / totalInput) * 100).toFixed(1) : 0;
+                        return `
+                            <div class="legend-item">
+                                <div class="legend-color" style="background:${CATEGORY_COLORS[cat] || '#64748b'}"></div>
+                                <span class="legend-label">${CATEGORY_NAMES[cat] || cat}</span>
+                                <span class="legend-value">${tokens.toLocaleString()} (${pct}%)</span>
+                            </div>
+                        `;
+                    }).join('');
+                const totalRow = `
+                    <div class="legend-item" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #334155; font-weight: 600;">
+                        <div class="legend-color" style="background: #94a3b8;"></div>
+                        <span class="legend-label" style="color: #f8fafc;">Total</span>
+                        <span class="legend-value">${totalInput.toLocaleString()}</span>
+                    </div>
+                `;
+                legendEl.innerHTML = items + totalRow;
+            }
+        }
+
+        function renderChunkTable(chunks, totalInput) {
+            const tbody = document.getElementById('chunkTableBody');
+            if (!tbody) return;
+            const rows = chunks.map((chunk, idx) => {
+                const cat = chunk.category || 'other';
+                const tokens = chunk.tokens || 0;
+                const pct = totalInput > 0 ? ((tokens / totalInput) * 100).toFixed(1) : 0;
+                const color = CATEGORY_COLORS[cat] || '#64748b';
+                const preview = escapeHtml(chunk.content_preview || '');
+                return `
+                    <tr>
+                        <td><strong>${escapeHtml(chunk.name || '')}</strong></td>
+                        <td><span class="chunk-category cat-${cat}">${CATEGORY_NAMES[cat] || cat}</span></td>
+                        <td>${tokens.toLocaleString()}</td>
+                        <td>
+                            ${pct}%
+                            <div class="token-bar"><div class="token-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+                        </td>
+                        <td>
+                            <div class="content-preview" onclick="this.classList.toggle('expanded')">${preview}</div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+            tbody.innerHTML = rows;
+        }
+
+        // --- Auto refresh ---
+        let lastCheckpoint = null;
+
+        async function refresh() {
+            try {
+                const cp = await fetchLatestCheckpoint();
+                if (!cp) {
+                    const info = document.getElementById('refreshInfo');
+                    info.textContent = `等待新对话... (${new Date().toLocaleTimeString('zh-CN')})`;
+                    return;
+                }
+
+                const cpKey = `${cp.session_count}#${cp.turn_count}#${cp.total_input_tokens}`;
+                const lastKey = lastCheckpoint ? `${lastCheckpoint.session_count}#${lastCheckpoint.turn_count}#${lastCheckpoint.total_input_tokens}` : null;
+
+                if (cpKey === lastKey) {
+                    const info = document.getElementById('refreshInfo');
+                    info.textContent = `共 ${cp.session_count} 会话 | ${cp.turn_count} 轮 | 等待新对话... (${new Date().toLocaleTimeString('zh-CN')})`;
+                    return;
+                }
+
+                lastCheckpoint = cp;
+                const newSessions = await fetchSessions();
+                const hadData = sessions.length > 0;
+                sessions = newSessions;
+                if (sessions.length > 0) {
+                    if (!hadData || newSessions.length > 0) {
+                        currentSessionIndex = 0;
+                        currentTurnIndex = 0;
+                    }
+                    if (currentSessionIndex >= sessions.length) currentSessionIndex = 0;
+                }
+                renderApp();
+                const info = document.getElementById('refreshInfo');
+                info.textContent = `最后更新: ${new Date().toLocaleTimeString('zh-CN')} | 共 ${cp.session_count} 会话 · ${cp.turn_count} 轮 · ${cp.total_input_tokens.toLocaleString()} in · ${cp.total_output_tokens.toLocaleString()} out`;
+            } catch (e) {
+                console.error('Refresh failed:', e);
+            }
+        }
+
+        // --- Init ---
+        refresh();
+        setInterval(refresh, 3000);
+    </script>
+</body>
+</html>

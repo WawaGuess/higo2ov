@@ -20,11 +20,13 @@ from models import (
     TransformResult,
 )
 from engine import OpenVikingConfig, OpenVikingClient, OpenVikingMemoryEngine
+from monitor.server import mount_monitor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Higo Session Memory Plugin")
+mount_monitor(app)
 
 ENGINE_NAME = "higo-openviking-bridge"
 ENGINE_VERSION = "1.1.0"
@@ -174,6 +176,17 @@ async def _handle_transform(
             len(msg.content),
         )
 
+    # Record turn data for monitoring (after message reconstruction)
+    from monitor.collector import TurnCollector
+    TurnCollector.get_instance().start_turn(
+        session_id=sid,
+        round_id=request.round.roundId if request.round else f"unknown_{time.time()}",
+        seq=request.round.seq if request.round else 0,
+        messages=[m.model_dump() for m in new_messages],
+        model_tokens=model_tokens,
+        memory_text=memory_text,
+    )
+
     return TransformResponse(
         ok=True,
         result=TransformResult(
@@ -217,6 +230,14 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
     ov_session_id = session_to_ov_id(session_id)
     asyncio.get_event_loop().create_task(
         memory_engine._maybe_commit(ov_session_id)
+    )
+
+    # Record turn output for monitoring
+    from monitor.collector import TurnCollector
+    TurnCollector.get_instance().end_turn(
+        round_id=round_id,
+        sections=[s.model_dump() for s in request.message.sections],
+        errors=[e.model_dump() for e in request.errors],
     )
 
     logger.info(
