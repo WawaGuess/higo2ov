@@ -223,21 +223,26 @@ class OpenVikingClient:
     async def find(
         self,
         query: str,
-        target_uri: str,
+        target_uri: Optional[str] = None,
         limit: int = 10,
         score_threshold: Optional[float] = None,
         agent_id: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> dict:
         """POST /api/v1/search/find — semantic search."""
-        normalized_target_uri = await self._normalize_target_uri(
-            target_uri, agent_id
-        )
-        body = {
+        body: dict[str, Any] = {
             "query": query,
-            "target_uri": normalized_target_uri,
             "limit": limit,
-            "score_threshold": score_threshold,
         }
+        if target_uri is not None:
+            normalized_target_uri = await self._normalize_target_uri(
+                target_uri, agent_id
+            )
+            body["target_uri"] = normalized_target_uri
+        if score_threshold is not None:
+            body["score_threshold"] = score_threshold
+        if mode is not None:
+            body["mode"] = mode
         return await self._request(
             "/api/v1/search/find",
             {"method": "POST", "body": body},

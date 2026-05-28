@@ -23,8 +23,8 @@
 | 健康检查 | `mode=probe` 调用 OpenViking `GET /health` | 通过 Higo 插件协议暴露，不是 OpenClaw 注册式健康检查 |
 | 当前 user 捕获 | `transform` 中识别最后一条 user，合并 system 前缀后写入 OV session | 不捕获 transform 中的 assistant；assistant 在 `result` 阶段捕获 |
 | assistant/tool 捕获 | `mode=result` 读取 `message.sections`，`content` 写为 assistant，`tool` 写为 tool part | 依赖 Higo V2 result 回调；不是 OpenClaw `afterTurn` hook |
-| 自动召回 | `transform` 中搜索 `viking://user/memories`、`viking://agent/memories`，可选 `viking://resources` | 作为 HTTP transform 的一部分执行 |
-| 召回后处理 | URI 去重、叶子记忆过滤、score 阈值过滤、query-aware rerank | 没有完整上下文分区预算，只对注入记忆做预算 |
+| 自动召回 | `transform` 中全局搜索（`mode: "auto"`, `limit: 20`），过滤 `.abstract.md` / `.overview.md` | 作为 HTTP transform 的一部分执行 |
+| 召回后处理 | `pick_memories_for_injection`：query-aware 排序 → 内容去重 → leaf 优先 → limit 截断 | 没有完整上下文分区预算，只对注入记忆做预算 |
 | 记忆注入 | 将 memory 作为独立 `user` 消息插入到第一个 user 前 | 不改 system prompt；必须满足 Higo 对原始消息保留和 current user 位置校验 |
 | Session ID 映射 | UUID 直接使用，非 UUID 使用 sha256 | 与 OpenViking session 存储兼容，旧原始 sessionId 数据需迁移 |
 | 异步归档 | transform/result 后调度 `_maybe_commit()`，超过阈值时 `commit(wait=false)` | 不阻塞 Higo 响应 |

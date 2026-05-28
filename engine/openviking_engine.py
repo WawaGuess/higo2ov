@@ -9,11 +9,8 @@ from engine.config import OpenVikingConfig
 from engine.diagnostics import emit_diag
 from engine.memory import MemoryEngine
 from engine.memory_ranking import (
-    apply_score_threshold,
     build_memory_lines_with_budget,
-    deduplicate_by_uri,
-    filter_leaf_memories,
-    rerank_memories,
+    pick_memories_for_injection,
 )
 from engine.agent_resolver import AgentResolver
 from engine.openviking_client import OpenVikingClient
@@ -26,6 +23,12 @@ from engine.text_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_directory_description(result: dict) -> bool:
+    """Check if result is a directory description file (.abstract.md / .overview.md)."""
+    uri = result.get("uri", "")
+    return uri.endswith(".abstract.md") or uri.endswith(".overview.md")
 
 
 class OpenVikingMemoryEngine(MemoryEngine):
@@ -294,98 +297,74 @@ class OpenVikingMemoryEngine(MemoryEngine):
         )
 
     async def _recall_memories(self, query_text: str) -> list[dict]:
-        """Search user and agent memories in parallel."""
+        """Search memories globally (reference-code style)."""
         if not query_text.strip():
             logger.info("[recall] query is empty, skipping")
             return []
 
         agent_id = self._resolve_agent_id("")
-        user_uri = "viking://user/memories"
-        agent_uri = "viking://agent/memories"
 
         logger.info(
-            "[recall] query='%s...' limit=%s threshold=%s",
+            "[recall] query='%s...' limit=20 mode=auto",
             query_text[:80],
-            self.config.recall_limit,
-            self.config.recall_score_threshold,
         )
 
-        tasks = [
-            self._safe_find(
-                query_text,
-                user_uri,
-                self.config.recall_limit,
-                self.config.recall_score_threshold,
-                agent_id,
-            ),
-            self._safe_find(
-                query_text,
-                agent_uri,
-                self.config.recall_limit,
-                self.config.recall_score_threshold,
-                agent_id,
-            ),
+        result = await self._safe_find(
+            query_text,
+            limit=20,
+            mode="auto",
+            agent_id=agent_id,
+        )
+        results = result.get("memories", [])
+
+        # Filter out directory description files (.abstract.md / .overview.md)
+        before_filter = len(results)
+        results = [
+            r for r in results
+            if not _is_directory_description(r)
         ]
-
-        # Optionally search resources
-        if self.config.recall_resources:
-            tasks.append(
-                self._safe_find(
-                    query_text,
-                    "viking://resources",
-                    self.config.recall_limit,
-                    self.config.recall_score_threshold,
-                    agent_id,
-                )
+        if len(results) < before_filter:
+            logger.info(
+                "[recall] filtered %s directory descriptions",
+                before_filter - len(results),
             )
-
-        results: list[dict] = []
-        find_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in find_results:
-            if isinstance(res, Exception):
-                logger.warning("[recall] find failed: %s", res)
-                continue
-            memories = res.get("memories", [])
-            results.extend(memories)
 
         logger.info("[recall] raw results=%s", len(results))
 
         # Post-processing
-        results = deduplicate_by_uri(results)
-        logger.info("[recall] after dedup=%s", len(results))
-        results = filter_leaf_memories(results)
-        logger.info("[recall] after leaf filter=%s", len(results))
-        results = apply_score_threshold(
-            results, self.config.recall_score_threshold
+        results = pick_memories_for_injection(
+            results,
+            self.config.recall_inject_limit,
+            query_text,
+            self.config.recall_score_threshold,
         )
-        logger.info("[recall] after threshold=%s", len(results))
-        results = rerank_memories(results, query_text)
-        logger.info("[recall] after rerank=%s", len(results))
+        logger.info("[recall] after pick=%s", len(results))
 
         return results
 
     async def _safe_find(
         self,
         query: str,
-        target_uri: str,
-        limit: int,
-        score_threshold: float | None,
+        target_uri: str | None = None,
+        limit: int = 10,
+        score_threshold: float | None = None,
         agent_id: str | None = None,
+        mode: str | None = None,
     ) -> dict:
         """Wrapper that catches exceptions."""
         try:
             result = await self.client.find(
-                query, target_uri, limit, score_threshold, agent_id
+                query, target_uri, limit, score_threshold, agent_id, mode
             )
             memories = result.get("memories", [])
             logger.info(
                 "[safe_find] uri=%s returned=%s",
-                target_uri,
+                target_uri or "(global)",
                 len(memories),
             )
             return result
         except Exception as e:
-            logger.warning("[safe_find] error for %s: %s", target_uri, e)
+            logger.warning("[safe_find] error for %s: %s", target_uri or "(global)", e)
             return {}
 
     def _assemble_memory_text(

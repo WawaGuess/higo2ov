@@ -21,6 +21,7 @@ class OpenVikingConfig(BaseModel):
     commit_token_threshold: int = Field(default=8000)
     recall_limit: int = Field(default=10)
     recall_score_threshold: float = Field(default=0.1)
+    recall_inject_limit: int = Field(default=6)
     isolate_user_scope_by_agent: bool = Field(default=False)
     isolate_agent_scope_by_user: bool = Field(default=True)
 
@@ -58,6 +59,9 @@ class OpenVikingConfig(BaseModel):
             recall_limit=int(os.getenv("OPENVIKING_RECALL_LIMIT", "10")),
             recall_score_threshold=float(
                 os.getenv("OPENVIKING_RECALL_SCORE_THRESHOLD", "0.1")
+            ),
+            recall_inject_limit=int(
+                os.getenv("OPENVIKING_RECALL_INJECT_LIMIT", "6")
             ),
             isolate_user_scope_by_agent=os.getenv(
                 "OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT", "false"

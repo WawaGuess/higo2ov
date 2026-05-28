@@ -248,31 +248,24 @@ Step 5: Async commit（异步提交）
 
 **召回搜索**（`_recall_memories`）：
 
-并行搜索以下 URI：
-- `viking://user/memories`
-- `viking://agent/memories`
-- `viking://resources`（仅在 `recall_resources=True` 时）
+单次全局搜索，不指定 `target_uri`，参数为：
+- `limit: 20`
+- `mode: "auto"`
 
-每个搜索使用 `recall_limit` 和 `recall_score_threshold` 作为参数。
+返回结果先过滤掉目录描述文件（URI 以 `.abstract.md` 或 `.overview.md` 结尾），再进入后处理。
 
-**后处理流水线**（依次执行）：
-1. `deduplicate_by_uri()` — 按 URI 去重，保留 score 最高的一条
-2. `filter_leaf_memories()` — 只保留 `level == 2` 的叶子记忆
-3. `apply_score_threshold()` — 按 `recall_score_threshold` 过滤
-4. `rerank_memories()` — Query-aware 重排序（见第 7 节）
+**后处理**（`pick_memories_for_injection`）：
+
+1. **Query-aware 排序** — 综合 base score + leaf boost(0.12) + event temporal boost(0.1) + preference boost(0.08) + lexical overlap boost(0~0.2)
+2. **去重** — event/case 按 URI 去重，其他按 `abstract:category:normalized_abstract` 去重
+3. **Leaf 优先** — 先取所有 `level == 2` 的 leaf；若 leaf 数量 ≥ `recall_inject_limit`（默认 6），直接返回前 limit 条
+4. **Fallback 补充** — leaf 不足时，从去重后的结果中补充非 leaf，直到达到 limit；补充时检查 score ≥ `recall_score_threshold`
 
 **文本组装**（`_assemble_memory_text`）：
 
-按以下顺序组装文本块：
+只输出 `<relevant-memories>` 块：
 
 ```
-[Session History Summary]
-{latest_archive_overview}
-
-[Archive Index]
-- {archive_id}: {abstract}
-...
-
 <relevant-memories>
 - [{category}] {content} ({score})
 ...
@@ -281,7 +274,7 @@ Step 5: Async commit（异步提交）
 
 记忆行通过 `build_memory_lines_with_budget()` 构建，受 `recall_token_budget` 限制：
 - 第一条记忆**强制包含**（即使超出预算）
-- 后续记忆按 ~4 chars/token 估算，超出预算时停止追加
+- 后续记忆使用 `_count_tokens()`（tiktoken 精确估算，不可用则字符回退）检查预算，超出时停止追加
 
 #### Step 5: Async Commit（`_maybe_commit`）
 
@@ -374,45 +367,43 @@ Metadata keys 检测集合：`session, sessionid, sessionkey, conversationid, ch
 
 ## 6. 记忆排序与预算：`memory_ranking.py`
 
-### 6.1 后处理流水线
+### 6.1 `pick_memories_for_injection`
 
-| 函数 | 作用 | 输入 |
-|------|------|------|
-| `deduplicate_by_uri()` | 按 URI 去重，保留 score 最高 | raw results |
-| `filter_leaf_memories()` | 只保留 `level == 2` | deduped |
-| `apply_score_threshold()` | score ≥ threshold | leaf |
-| `rerank_memories()` | Query-aware 重排序 | thresholded |
-
-### 6.2 Query-Aware 重排序
-
-对每条记忆计算 boost 后的 score：
+参考代码对齐实现，单函数完成排序、去重、leaf 优先、limit 截断：
 
 ```
-boosted_score = base_score
-              + leaf_boost(0.12)
-              + event_temporal_boost(0.1)
-              + preference_boost(0.08)
-              + lexical_overlap_boost(0~0.2)
+输入: raw results, limit, query_text, score_threshold
+  ↓
+Query-aware 排序（rankForInjection）
+  ↓
+去重（getMemoryDedupeKey）
+  ↓
+分离 leaf（level == 2）与非 leaf
+  ↓
+leaf ≥ limit ? 返回 leaf[:limit]
+  : 补充非 leaf（检查 score ≥ threshold，检查 URI 未使用）
 ```
 
-| Boost | 触发条件 | 值 |
-|-------|---------|-----|
-| Leaf | `level == 2` | +0.12 |
-| Event Temporal | query 含时间词 **且** `category == "events"` | +0.1 |
-| Preference | query 含偏好词 **且** `category == "preferences"` | +0.08 |
-| Lexical Overlap | query 词在 `abstract + overview + uri` 中出现次数 | +0.05/词，上限 0.2 |
+**Query-aware 排序因子**：
+
+| 因子 | 触发条件 | 值 |
+|------|---------|-----|
+| Leaf Boost | `level == 2` | +0.12 |
+| Event Temporal Boost | query 含时间词 **且** `category == "events"` | +0.1 |
+| Preference Boost | query 含偏好词 **且** `category == "preferences"` | +0.08 |
+| Lexical Overlap | query 词在 `uri + abstract` 中出现 | +0.05/词，上限 0.2 |
 
 Temporal 关键词：`when, time, date, yesterday, today, tomorrow, last week, before, after, 之前, 之后, 昨天, 今天, 明天, 上周`
 
 Preference 关键词：`prefer, like, want, 喜欢, 偏好, 习惯, preference`
 
-### 6.3 Token Budget 注入
+### 6.2 Token Budget 注入
 
 `build_memory_lines_with_budget(results, token_budget)`：
 
 - 第 1 条记忆**强制包含**（即使超出预算）
-- 第 2 条起：估算当前已用 token = `len("\n".join(lines)) // 4`
-- 若 `estimated_tokens < token_budget` 则追加，否则停止
+- 第 2 条起：使用 `_count_tokens()`（tiktoken `cl100k_base` 精确编码，不可用时字符回退）检查累计 token 数
+- 若累计 token ≤ `token_budget` 则追加，否则停止
 
 行格式：`- [{category}] {abstract/overview} ({score:.0%})`
 
@@ -543,8 +534,9 @@ X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
 | `OPENVIKING_USER_ID` | `""` | str | 用户 ID |
 | `OPENVIKING_TIMEOUT_MS` | `30000` | int | HTTP 请求超时（毫秒） |
 | `OPENVIKING_COMMIT_TOKEN_THRESHOLD` | `8000` | int | 自动提交 token 阈值 |
-| `OPENVIKING_RECALL_LIMIT` | `10` | int | 召回结果数量上限 |
-| `OPENVIKING_RECALL_SCORE_THRESHOLD` | `0.1` | float | 召回最低相似度阈值 |
+| `OPENVIKING_RECALL_LIMIT` | `10` | int | 单次搜索返回数量上限（搜索层） |
+| `OPENVIKING_RECALL_SCORE_THRESHOLD` | `0.1` | float | 召回最低相似度阈值（fallback 过滤） |
+| `OPENVIKING_RECALL_INJECT_LIMIT` | `6` | int | 最终注入记忆数量上限（默认 6） |
 | `OPENVIKING_ISOLATE_USER_SCOPE_BY_AGENT` | `false` | bool | 按 Agent 隔离用户作用域 |
 | `OPENVIKING_ISOLATE_AGENT_SCOPE_BY_USER` | `true` | bool | 按用户隔离 Agent 作用域 |
 | `OPENVIKING_AUTO_CAPTURE` | `true` | bool | 是否自动捕获消息 |
