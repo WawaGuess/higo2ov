@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Higo Session Memory Plugin")
 mount_monitor(app)
 
+
+@app.get("/api/stats")
+async def api_stats(since: float | None = None):
+    """Return full aggregated token stats with per-session details."""
+    from monitor.collector import TurnCollector
+
+    collector = TurnCollector.get_instance()
+    return collector.get_global_stats(since=since, detail=True)
+
+
+@app.get("/api/stats/summary")
+async def api_stats_summary(since: float | None = None):
+    """Return lightweight aggregated token stats (no per-session details)."""
+    from monitor.collector import TurnCollector
+
+    collector = TurnCollector.get_instance()
+    return collector.get_global_stats(since=since, detail=False)
+
+
 ENGINE_NAME = "higo-openviking-bridge"
 ENGINE_VERSION = "1.1.0"
 

@@ -585,6 +585,34 @@ X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
 | false | `commit_timeout` | Phase 2 轮询超时 |
 | false | `commit_error` | 提交过程异常 |
 
+### 11.2 Token 统计 API
+
+两个 GET 端点用于查询全量 session 的 token 聚合统计，数据来源于 `TurnCollector`（详见 `docs/design/token-stats-api.md`）：
+
+| 端点 | 说明 |
+|------|------|
+| `GET /api/stats` | 完整统计，含每个 session 的明细 |
+| `GET /api/stats/summary` | 轻量统计，仅返回聚合值（无 `sessions` 数组） |
+
+**请求参数**（两者相同）：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `since` | float | 否 | Unix 时间戳（秒），只返回 `updated_at >= since` 的 session |
+
+**响应示例**（`/api/stats/summary`）：
+
+```json
+{
+  "total_sessions": 13,
+  "total_turns": 21,
+  "total_input_tokens": 5883,
+  "total_output_tokens": 7267,
+  "total_tokens": 13150,
+  "since": null
+}
+```
+
 ---
 
 ## 12. 关键边界与注意事项

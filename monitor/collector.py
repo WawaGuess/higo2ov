@@ -428,17 +428,16 @@ class TurnCollector:
     # Query API
     # ------------------------------------------------------------------
 
-    def list_sessions(self) -> list[dict]:
+    def list_sessions(self, include_latest_turn: bool = True) -> list[dict]:
         """Return all sessions overview, newest first."""
         result = []
         for session_id, turns in self._sessions.items():
             if not turns:
                 continue
             latest = max(turns, key=lambda t: t.created_at)
-            result.append({
+            session = {
                 "session_id": session_id,
                 "turn_count": len(turns),
-                "latest_turn": latest.to_dict(),
                 "created_at": turns[0].created_at,
                 "updated_at": latest.created_at,
                 "totals": {
@@ -446,7 +445,10 @@ class TurnCollector:
                     "total_output_tokens": sum(t.total_output_tokens for t in turns),
                     "total_tokens": sum(t.total_tokens for t in turns),
                 },
-            })
+            }
+            if include_latest_turn:
+                session["latest_turn"] = latest.to_dict()
+            result.append(session)
         return sorted(result, key=lambda s: s["updated_at"], reverse=True)
 
     def get_session(self, session_id: str) -> Optional[dict]:
@@ -473,6 +475,31 @@ class TurnCollector:
                 if latest is None or t.created_at > latest.created_at:
                     latest = t
         return latest.to_dict() if latest else None
+
+    def get_global_stats(
+        self, since: float | None = None, detail: bool = True
+    ) -> dict:
+        """Aggregate token stats across all sessions."""
+        sessions = self.list_sessions(include_latest_turn=detail)
+        if since is not None:
+            sessions = [s for s in sessions if s.get("updated_at", 0.0) >= since]
+        result = {
+            "total_sessions": len(sessions),
+            "total_turns": sum(s.get("turn_count", 0) for s in sessions),
+            "total_input_tokens": sum(
+                s.get("totals", {}).get("total_input_tokens", 0) for s in sessions
+            ),
+            "total_output_tokens": sum(
+                s.get("totals", {}).get("total_output_tokens", 0) for s in sessions
+            ),
+            "total_tokens": sum(
+                s.get("totals", {}).get("total_tokens", 0) for s in sessions
+            ),
+            "since": since,
+        }
+        if detail:
+            result["sessions"] = sessions
+        return result
 
     # ------------------------------------------------------------------
     # Persistence

@@ -407,7 +407,20 @@ curl -X POST http://<higo2ov-host>:8000/compact \
   -d '{"sessionId": "s1"}'
 ```
 
-### 6.4 通过 Higo 前端验证
+### 6.4 验证 Token 统计 API
+
+```bash
+# 完整统计（含 session 明细）
+curl http://<higo2ov-host>:8000/api/stats
+
+# 轻量统计（仅聚合值）
+curl http://<higo2ov-host>:8000/api/stats/summary
+
+# 按时间过滤
+curl "http://<higo2ov-host>:8000/api/stats/summary?since=1779960000"
+```
+
+### 6.5 通过 Higo 前端验证
 
 1. 在 Higo 前端进入目标 Session
 2. 打开「会话配置」→ 填写 higo2ov endpoint → 点击「测试 endpoint」
@@ -415,7 +428,7 @@ curl -X POST http://<higo2ov-host>:8000/compact \
 4. 发送一条用户消息
 5. 观察 higo2ov 日志应出现 `[transform] sessionId=...` 和 `[result] sessionId=...`
 
-### 6.5 日志检查清单
+### 6.6 日志检查清单
 
 在 higo2ov 日志中应看到以下关键日志：
 
@@ -562,4 +575,13 @@ curl -X POST http://localhost:8000/ -H "Content-Type: application/json" \
 # higo2ov 强制归档
 curl -X POST http://localhost:8000/compact -H "Content-Type: application/json" \
   -d '{"sessionId":"s1"}'
+
+# Token 统计（完整）
+curl http://localhost:8000/api/stats
+
+# Token 统计（轻量）
+curl http://localhost:8000/api/stats/summary
+
+# Token 统计（按时间过滤）
+curl "http://localhost:8000/api/stats/summary?since=1779960000"
 ```
