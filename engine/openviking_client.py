@@ -50,14 +50,12 @@ class OpenVikingClient:
         )
         self._identity_cache: dict[str, dict] = {}
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, user_id: Optional[str] = None) -> dict[str, str]:
         headers: dict[str, str] = {}
         if self.config.api_key:
             headers["X-API-Key"] = self.config.api_key
-        if self.config.account_id:
-            headers["X-OpenViking-Account"] = self.config.account_id
-        if self.config.user_id:
-            headers["X-OpenViking-User"] = self.config.user_id
+        if user_id:
+            headers["X-OpenViking-User"] = user_id
         if self.config.agent_id:
             headers["X-OpenViking-Agent"] = self.config.agent_id
         return headers
@@ -93,7 +91,7 @@ class OpenVikingClient:
             "agentId": effective_agent_id or "default",
         }
         try:
-            status = await self._request(
+            status = await self.request(
                 "/api/v1/system/status", {}, agent_id
             )
             user_id = status.get("user", "")
@@ -111,22 +109,27 @@ class OpenVikingClient:
             self._identity_cache[effective_agent_id] = fallback
             return fallback
 
-    async def _build_canonical_root(self, scope: str, agent_id: Optional[str] = None) -> str:
-        identity = await self.get_runtime_identity(agent_id)
-        user_id = identity.get("userId", "default")
+    async def _build_canonical_root(
+        self, scope: str, agent_id: Optional[str] = None, user_id: Optional[str] = None
+    ) -> str:
+        if user_id:
+            effective_user_id = user_id
+        else:
+            identity = await self.get_runtime_identity(agent_id)
+            effective_user_id = identity.get("userId", "default")
         effective_agent_id = agent_id or self.config.agent_id
 
         if scope == "user":
             if self.config.isolate_user_scope_by_agent:
-                return f"viking://user/{user_id}/agent/{effective_agent_id}"
-            return f"viking://user/{user_id}"
+                return f"viking://user/{effective_user_id}/agent/{effective_agent_id}"
+            return f"viking://user/{effective_user_id}"
 
         if self.config.isolate_agent_scope_by_user:
-            return f"viking://agent/{effective_agent_id}/user/{user_id}"
+            return f"viking://agent/{effective_agent_id}/user/{effective_user_id}"
         return f"viking://agent/{effective_agent_id}"
 
     async def _normalize_target_uri(
-        self, target_uri: str, agent_id: Optional[str] = None
+        self, target_uri: str, agent_id: Optional[str] = None, user_id: Optional[str] = None
     ) -> str:
         import re
 
@@ -148,20 +151,21 @@ class OpenVikingClient:
         if parts[0] not in reserved_dirs:
             return trimmed
 
-        root = await self._build_canonical_root(scope, agent_id)
+        root = await self._build_canonical_root(scope, agent_id, user_id)
         return f"{root}/{ '/'.join(parts)}"
 
-    async def _request(
+    async def request(
         self,
         path: str,
         init: dict[str, Any] = {},
         agent_id: Optional[str] = None,
         request_timeout_ms: Optional[int] = None,
+        user_id: Optional[str] = None,
     ) -> dict:
         import time
 
         effective_agent_id = agent_id or self.config.agent_id
-        headers = dict(self._headers())
+        headers = dict(self._headers(user_id))
 
         body = init.get("body")
         if body and not isinstance(body, (str, bytes)):
@@ -181,10 +185,11 @@ class OpenVikingClient:
         method = init.get("method", "GET")
         url = f"{self.config.base_url}{path}"
         logger.info(
-            "[ov_request] %s %s agent=%s body_len=%s",
+            "[ov_request] %s %s agent=%s user=%s body_len=%s",
             method,
             path,
             effective_agent_id,
+            user_id or "(config)",
             len(init_body) if init_body else 0,
         )
 
@@ -228,6 +233,7 @@ class OpenVikingClient:
         score_threshold: Optional[float] = None,
         agent_id: Optional[str] = None,
         mode: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> dict:
         """POST /api/v1/search/find — semantic search."""
         body: dict[str, Any] = {
@@ -236,17 +242,18 @@ class OpenVikingClient:
         }
         if target_uri is not None:
             normalized_target_uri = await self._normalize_target_uri(
-                target_uri, agent_id
+                target_uri, agent_id, user_id
             )
             body["target_uri"] = normalized_target_uri
         if score_threshold is not None:
             body["score_threshold"] = score_threshold
         if mode is not None:
             body["mode"] = mode
-        return await self._request(
+        return await self.request(
             "/api/v1/search/find",
             {"method": "POST", "body": body},
             agent_id,
+            user_id=user_id,
         )
 
     async def add_session_message(
@@ -256,6 +263,7 @@ class OpenVikingClient:
         parts: list[dict],
         created_at: Optional[str] = None,
         role_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> dict:
         """POST /api/v1/sessions/{id}/messages."""
         body: dict[str, Any] = {"role": role, "parts": parts}
@@ -263,25 +271,28 @@ class OpenVikingClient:
             body["created_at"] = created_at
         if role_id:
             body["role_id"] = role_id
-        return await self._request(
+        return await self.request(
             f"/api/v1/sessions/{session_id}/messages",
             {"method": "POST", "body": body},
+            user_id=user_id,
         )
 
-    async def get_session(self, session_id: str) -> dict:
+    async def get_session(self, session_id: str, user_id: Optional[str] = None) -> dict:
         """GET /api/v1/sessions/{id} — returns meta including pending_tokens."""
-        return await self._request(
+        return await self.request(
             f"/api/v1/sessions/{session_id}",
             {"method": "GET"},
+            user_id=user_id,
         )
 
     async def get_session_context(
-        self, session_id: str, token_budget: int = 128_000
+        self, session_id: str, token_budget: int = 128_000, user_id: Optional[str] = None
     ) -> dict:
         """GET /api/v1/sessions/{id}/context — assembled session context."""
-        return await self._request(
+        return await self.request(
             f"/api/v1/sessions/{session_id}/context?token_budget={token_budget}",
             {"method": "GET"},
+            user_id=user_id,
         )
 
     async def commit_session(
@@ -289,15 +300,17 @@ class OpenVikingClient:
         session_id: str,
         wait: bool = False,
         timeout_ms: Optional[int] = None,
+        user_id: Optional[str] = None,
     ) -> dict:
         """POST /api/v1/sessions/{id}/commit — archive + memory extraction.
 
         wait=False: returns immediately after Phase 1.
         wait=True: polls until Phase 2 completes.
         """
-        result = await self._request(
+        result = await self.request(
             f"/api/v1/sessions/{session_id}/commit",
             {"method": "POST", "body": {}},
+            user_id=user_id,
         )
 
         if not wait or not result.get("task_id"):
@@ -332,35 +345,39 @@ class OpenVikingClient:
         result["status"] = "timeout"
         return result
 
-    async def get_task(self, task_id: str) -> dict:
+    async def get_task(self, task_id: str, user_id: Optional[str] = None) -> dict:
         """GET /api/v1/tasks/{task_id} — poll background task."""
-        return await self._request(
+        return await self.request(
             f"/api/v1/tasks/{task_id}",
             {"method": "GET"},
+            user_id=user_id,
         )
 
     async def get_session_archive(
-        self, session_id: str, archive_id: str
+        self, session_id: str, archive_id: str, user_id: Optional[str] = None
     ) -> dict:
         """GET /api/v1/sessions/{id}/archives/{archiveId}."""
-        return await self._request(
+        return await self.request(
             f"/api/v1/sessions/{session_id}/archives/{archive_id}",
             {"method": "GET"},
+            user_id=user_id,
         )
 
-    async def delete_session(self, session_id: str) -> dict:
+    async def delete_session(self, session_id: str, user_id: Optional[str] = None) -> dict:
         """DELETE /api/v1/sessions/{id}."""
-        return await self._request(
+        return await self.request(
             f"/api/v1/sessions/{session_id}",
             {"method": "DELETE"},
+            user_id=user_id,
         )
 
-    async def delete_uri(self, uri: str) -> dict:
+    async def delete_uri(self, uri: str, user_id: Optional[str] = None) -> dict:
         """DELETE /api/v1/fs?uri=..."""
         import urllib.parse
 
         encoded = urllib.parse.quote(uri)
-        return await self._request(
+        return await self.request(
             f"/api/v1/fs?uri={encoded}&recursive=false",
             {"method": "DELETE"},
+            user_id=user_id,
         )

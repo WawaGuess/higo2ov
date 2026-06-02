@@ -9,4 +9,5 @@ __pycache__/
 venv/
 .idea/
 data/
+.account_registry.json
 /.codegraph/

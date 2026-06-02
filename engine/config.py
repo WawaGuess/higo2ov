@@ -15,8 +15,7 @@ class OpenVikingConfig(BaseModel):
     base_url: str = Field(default="http://127.0.0.1:1933")
     api_key: str = Field(default="")
     agent_id: str = Field(default="default")
-    account_id: str = Field(default="")
-    user_id: str = Field(default="")
+    account_registry_path: str = Field(default=".account_registry.json")
     timeout_ms: int = Field(default=30000)
     commit_token_threshold: int = Field(default=8000)
     recall_limit: int = Field(default=10)
@@ -48,10 +47,11 @@ class OpenVikingConfig(BaseModel):
         """Load configuration from .env file."""
         return cls(
             base_url=os.getenv("OPENVIKING_BASE_URL", "http://127.0.0.1:1933"),
-            api_key=os.getenv("OPENVIKING_API_KEY", ""),
+            api_key=os.getenv("OPENVIKING_ROOT_API_KEY", ""),
             agent_id=os.getenv("OPENVIKING_AGENT_ID", "default"),
-            account_id=os.getenv("OPENVIKING_ACCOUNT_ID", ""),
-            user_id=os.getenv("OPENVIKING_USER_ID", ""),
+            account_registry_path=os.getenv(
+                "OPENVIKING_ACCOUNT_REGISTRY_PATH", ".account_registry.json"
+            ),
             timeout_ms=int(os.getenv("OPENVIKING_TIMEOUT_MS", "30000")),
             commit_token_threshold=int(
                 os.getenv("OPENVIKING_COMMIT_TOKEN_THRESHOLD", "8000")

@@ -20,6 +20,7 @@ from models import (
     TransformResult,
 )
 from engine import OpenVikingConfig, OpenVikingClient, OpenVikingMemoryEngine
+from engine.account_registry import AccountRegistry
 from monitor.server import mount_monitor
 
 logging.basicConfig(level=logging.INFO)
@@ -52,8 +53,12 @@ ENGINE_VERSION = "1.1.0"
 
 # Initialize OpenViking engine
 _ov_config = OpenVikingConfig.from_env()
-_ov_client = OpenVikingClient(_ov_config)
-memory_engine = OpenVikingMemoryEngine(_ov_config, _ov_client)
+_admin_client = OpenVikingClient(_ov_config)
+_account_registry = AccountRegistry(
+    _ov_config.account_registry_path,
+    _admin_client,
+)
+memory_engine = OpenVikingMemoryEngine(_ov_config, _admin_client, _account_registry)
 
 
 @app.post("/")
@@ -100,12 +105,15 @@ async def compact(request: Request):
     """Force-commit an OpenViking session and return the post-compact summary."""
     body = await request.json()
     session_id = body.get("sessionId", "")
+    session_data = body.get("session", {})
+    raw_user_id = session_data.get("userId") if isinstance(session_data, dict) else None
+    user_id = f"higo_{raw_user_id}" if raw_user_id else None
     if not session_id:
         return JSONResponse(
             status_code=400,
             content={"ok": False, "error": "sessionId is required"},
         )
-    result = await memory_engine.compact(session_id)
+    result = await memory_engine.compact(session_id, user_id=user_id)
     return JSONResponse(content=result)
 
 
@@ -118,7 +126,7 @@ async def _handle_probe(request: ProbeRequest) -> ProbeResponse:
         request.timestamp,
     )
     try:
-        health = await _ov_client.health_check()
+        health = await _admin_client.health_check()
         logger.info("[probe] OpenViking health ok: %s", health)
         return ProbeResponse(
             ok=True,
@@ -138,6 +146,8 @@ async def _handle_transform(
     request: TransformRequest,
 ) -> TransformResponse:
     sid = request.session.sessionId if request.session else "unknown"
+    raw_user_id = request.session.userId if request.session else None
+    user_id = f"higo_{raw_user_id}" if raw_user_id else None
     original_messages = request.request.messages
     anchor_seq = request.round.seq if request.round else 0
     anchor_sub = 0
@@ -148,8 +158,9 @@ async def _handle_transform(
     )
 
     logger.info(
-        "[transform] sessionId=%s anchor=%s/%s msg_count=%s modelTokens=%s",
+        "[transform] sessionId=%s userId=%s anchor=%s/%s msg_count=%s modelTokens=%s",
         sid,
+        user_id or "(default)",
         anchor_seq,
         anchor_sub,
         len(original_messages),
@@ -167,6 +178,7 @@ async def _handle_transform(
         sid,
         [m.model_dump() for m in original_messages],
         model_context_tokens=model_tokens,
+        user_id=user_id,
     )
     logger.info(
         "[transform] memory_text generated, length=%s",
@@ -224,12 +236,15 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
     into OpenViking session storage.
     """
     session_id = request.session.sessionId
+    raw_user_id = request.session.userId if request.session else None
+    user_id = f"higo_{raw_user_id}" if raw_user_id else None
     round_id = request.round.get("roundId", "unknown")
     status = request.round.get("status", "unknown")
 
     logger.info(
-        "[result] sessionId=%s roundId=%s status=%s sections=%s errors=%s",
+        "[result] sessionId=%s userId=%s roundId=%s status=%s sections=%s errors=%s",
         session_id,
+        user_id or "(default)",
         round_id,
         status,
         len(request.message.sections),
@@ -243,13 +258,14 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
             session_id,
             [s.model_dump() for s in request.message.sections],
             round_id=round_id,
+            user_id=user_id,
         )
 
     # Async commit if threshold exceeded
     from engine.session_utils import session_to_ov_id
     ov_session_id = session_to_ov_id(session_id)
     asyncio.get_event_loop().create_task(
-        memory_engine._maybe_commit(ov_session_id)
+        memory_engine._maybe_commit(ov_session_id, user_id=user_id)
     )
 
     # Record turn output for monitoring

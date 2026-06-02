@@ -6,7 +6,7 @@ class MemoryEngine(ABC):
 
     @abstractmethod
     async def generate_memory(
-        self, session_id: str, messages: list[dict], model_context_tokens: int = 0
+        self, session_id: str, messages: list[dict], model_context_tokens: int = 0, user_id: str | None = None
     ) -> str:
         """根据会话历史生成记忆摘要。"""
         ...
@@ -16,6 +16,6 @@ class PlaceholderMemoryEngine(MemoryEngine):
     """占位符实现，返回固定格式的记忆摘要。"""
 
     async def generate_memory(
-        self, session_id: str, messages: list[dict], model_context_tokens: int = 0
+        self, session_id: str, messages: list[dict], model_context_tokens: int = 0, user_id: str | None = None
     ) -> str:
         return f"[memory] session={session_id} placeholder summary"

@@ -13,6 +13,7 @@ from engine.memory_ranking import (
     pick_memories_for_injection,
 )
 from engine.agent_resolver import AgentResolver
+from engine.account_registry import AccountRegistry
 from engine.openviking_client import OpenVikingClient
 from engine.session_utils import session_to_ov_id
 from engine.text_utils import (
@@ -39,16 +40,26 @@ class OpenVikingMemoryEngine(MemoryEngine):
     """
 
     def __init__(
-        self, config: OpenVikingConfig, client: OpenVikingClient
+        self,
+        config: OpenVikingConfig,
+        admin_client: OpenVikingClient,
+        account_registry: AccountRegistry,
     ) -> None:
         self.config = config
-        self.client = client
+        self.admin_client = admin_client
+        self.account_registry = account_registry
         self._agent_resolver = AgentResolver(config.agent_id)
         self._bypass_patterns = compile_session_patterns(
             [p.strip() for p in config.bypass_session_patterns.split(",") if p.strip()]
         )
         # Round-id deduplication for result callback idempotency (keep last 1000)
         self._processed_round_ids: set[str] = set()
+
+    async def _resolve_client(self, user_id: str | None) -> OpenVikingClient:
+        """Return user-scoped client if user_id given, otherwise fallback to admin."""
+        if user_id:
+            return await self.account_registry.get_client(user_id)
+        return self.admin_client
 
     def _diag(
         self, stage: str, session_id: str, data: dict
@@ -60,7 +71,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         return self._agent_resolver.resolve(session_id)
 
     async def generate_memory(
-        self, session_id: str, messages: list[dict], model_context_tokens: int = 0
+        self, session_id: str, messages: list[dict], model_context_tokens: int = 0, user_id: str | None = None
     ) -> str:
         """Core entry called by main.py's transform handler.
 
@@ -101,16 +112,19 @@ class OpenVikingMemoryEngine(MemoryEngine):
 
         start = time.monotonic()
         logger.info(
-            "[generate_memory] start sessionId=%s ovSessionId=%s msg_count=%s",
+            "[generate_memory] start sessionId=%s ovSessionId=%s userId=%s msg_count=%s",
             session_id,
             ov_session_id,
+            user_id or "(default)",
             len(messages),
         )
+
+        client = await self._resolve_client(user_id)
 
         # 1. Capture messages
         capture_start = time.monotonic()
         if self.config.auto_capture:
-            await self._capture_messages(session_id, ov_session_id, messages)
+            await self._capture_messages(session_id, ov_session_id, messages, user_id=user_id)
         else:
             logger.info(
                 "[generate_memory] auto_capture disabled, skipping capture"
@@ -123,7 +137,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         ctx_start = time.monotonic()
         context = {}
         try:
-            context = await self.client.get_session_context(ov_session_id)
+            context = await client.get_session_context(ov_session_id, user_id=user_id)
             overview = context.get("latest_archive_overview", "")[:50]
             abstracts_count = len(context.get("pre_archive_abstracts", []))
             logger.info(
@@ -149,7 +163,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             logger.info("[generate_memory] recall query='%s'", query_text[:100])
 
             if query_text:
-                memories = await self._recall_memories(query_text)
+                memories = await self._recall_memories(query_text, user_id=user_id)
                 logger.info(
                     "[generate_memory] recall done in %.3fs, memories=%s",
                     time.monotonic() - recall_start,
@@ -185,7 +199,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             logger.info("[generate_memory] auto_recall disabled, skipping recall")
 
         # 5. Async commit if threshold exceeded
-        asyncio.create_task(self._maybe_commit(ov_session_id))
+        asyncio.create_task(self._maybe_commit(ov_session_id, user_id=user_id))
 
         total = time.monotonic() - start
         logger.info(
@@ -206,7 +220,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         return memory_text
 
     async def _capture_messages(
-        self, session_id: str, ov_session_id: str, messages: list[dict]
+        self, session_id: str, ov_session_id: str, messages: list[dict], user_id: str | None = None
     ) -> None:
         """Append user message to OpenViking session during transform.
 
@@ -247,6 +261,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
 
         captured = 0
         agent_id = self._resolve_agent_id(session_id)
+        client = await self._resolve_client(user_id)
 
         # 3. Store current user (merge system into parts)
         if current_user_msg:
@@ -268,12 +283,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
 
                 if parts and any(p.get("text") for p in parts):
                     try:
-                        await self.client.add_session_message(
+                        await client.add_session_message(
                             ov_session_id,
                             role="user",
                             role_id="user",
                             parts=parts,
                             created_at=datetime.now(timezone.utc).isoformat(),
+                            user_id=user_id,
                         )
                         captured += 1
                         logger.info(
@@ -296,7 +312,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             {"total_stored": captured, "agent_id": agent_id},
         )
 
-    async def _recall_memories(self, query_text: str) -> list[dict]:
+    async def _recall_memories(self, query_text: str, user_id: str | None = None) -> list[dict]:
         """Search memories globally (reference-code style)."""
         if not query_text.strip():
             logger.info("[recall] query is empty, skipping")
@@ -314,6 +330,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             limit=20,
             mode="auto",
             agent_id=agent_id,
+            user_id=user_id,
         )
         results = result.get("memories", [])
 
@@ -350,11 +367,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
         score_threshold: float | None = None,
         agent_id: str | None = None,
         mode: str | None = None,
+        user_id: str | None = None,
     ) -> dict:
         """Wrapper that catches exceptions."""
+        client = await self._resolve_client(user_id)
         try:
-            result = await self.client.find(
-                query, target_uri, limit, score_threshold, agent_id, mode
+            result = await client.find(
+                query, target_uri, limit, score_threshold, agent_id, mode, user_id
             )
             memories = result.get("memories", [])
             logger.info(
@@ -387,26 +406,29 @@ class OpenVikingMemoryEngine(MemoryEngine):
         )
         return text
 
-    async def _maybe_commit(self, ov_session_id: str) -> None:
+    async def _maybe_commit(self, ov_session_id: str, user_id: str | None = None) -> None:
         """Trigger commit if pending_tokens exceeds threshold."""
+        client = await self._resolve_client(user_id)
         try:
-            session_info = await self.client.get_session(ov_session_id)
+            session_info = await client.get_session(ov_session_id, user_id=user_id)
             pending_tokens = session_info.get("pending_tokens", 0)
             logger.info(
-                "[commit_check] ovSessionId=%s pending_tokens=%s threshold=%s",
+                "[commit_check] ovSessionId=%s userId=%s pending_tokens=%s threshold=%s",
                 ov_session_id,
+                user_id or "(default)",
                 pending_tokens,
                 self.config.commit_token_threshold,
             )
             if pending_tokens > self.config.commit_token_threshold:
                 logger.info(
-                    "[commit] triggering ovSessionId=%s (pending_tokens=%s > threshold=%s)",
+                    "[commit] triggering ovSessionId=%s userId=%s (pending_tokens=%s > threshold=%s)",
                     ov_session_id,
+                    user_id or "(default)",
                     pending_tokens,
                     self.config.commit_token_threshold,
                 )
-                commit_result = await self.client.commit_session(
-                    ov_session_id, wait=False
+                commit_result = await client.commit_session(
+                    ov_session_id, wait=False, user_id=user_id
                 )
                 logger.info(
                     "[commit] triggered for ovSessionId=%s status=%s archived=%s task_id=%s",
@@ -445,7 +467,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 {"error": str(e)},
             )
 
-    async def compact(self, session_id: str) -> dict:
+    async def compact(self, session_id: str, user_id: str | None = None) -> dict:
         """Force commit a session and return post-compact summary.
 
         Returns:
@@ -462,6 +484,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             }
         """
         ov_session_id = session_to_ov_id(session_id)
+        client = await self._resolve_client(user_id)
 
         self._diag(
             "compact_entry",
@@ -486,7 +509,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         # Pre-commit token estimate
         tokens_before: int | None = None
         try:
-            pre_ctx = await self.client.get_session_context(ov_session_id)
+            pre_ctx = await client.get_session_context(ov_session_id, user_id=user_id)
             estimated = pre_ctx.get("estimatedTokens")
             if isinstance(estimated, (int, float)) and estimated > 0:
                 tokens_before = int(estimated)
@@ -499,10 +522,12 @@ class OpenVikingMemoryEngine(MemoryEngine):
 
         try:
             logger.info(
-                "[compact] committing ovSessionId=%s (wait=true)", ov_session_id
+                "[compact] committing ovSessionId=%s userId=%s (wait=true)",
+                ov_session_id,
+                user_id or "(default)",
             )
-            commit_result = await self.client.commit_session(
-                ov_session_id, wait=True
+            commit_result = await client.commit_session(
+                ov_session_id, wait=True, user_id=user_id
             )
 
             mem_count = 0
@@ -592,7 +617,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             first_kept_entry_id = ""
 
             try:
-                post_ctx = await self.client.get_session_context(ov_session_id)
+                post_ctx = await client.get_session_context(ov_session_id, user_id=user_id)
                 overview = post_ctx.get("latest_archive_overview", "")
                 if isinstance(overview, str):
                     summary = overview.strip()
@@ -656,7 +681,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             }
 
     async def capture_round_result(
-        self, session_id: str, sections: list[dict], round_id: str = ""
+        self, session_id: str, sections: list[dict], round_id: str = "", user_id: str | None = None
     ) -> int:
         """Capture assistant reply and tool results from round sections.
 
@@ -690,6 +715,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         )
 
         captured = 0
+        client = await self._resolve_client(user_id)
         for section in sections:
             sec_type = section.get("type", "")
 
@@ -698,12 +724,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 if not text:
                     continue
                 try:
-                    await self.client.add_session_message(
+                    await client.add_session_message(
                         ov_session_id,
                         role="assistant",
                         role_id="assistant",
                         parts=[{"type": "text", "text": text}],
                         created_at=datetime.now(timezone.utc).isoformat(),
+                        user_id=user_id,
                     )
                     captured += 1
                     logger.info(
@@ -726,12 +753,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
                     }
                 ]
                 try:
-                    await self.client.add_session_message(
+                    await client.add_session_message(
                         ov_session_id,
                         role="user",
                         role_id="user",
                         parts=parts,
                         created_at=datetime.now(timezone.utc).isoformat(),
+                        user_id=user_id,
                     )
                     captured += 1
                     logger.info(
