@@ -140,11 +140,13 @@ class OpenVikingMemoryEngine(MemoryEngine):
             context = await client.get_session_context(ov_session_id)
             overview = context.get("latest_archive_overview", "")[:50]
             abstracts_count = len(context.get("pre_archive_abstracts", []))
+            active_msgs = context.get("messages", [])
             logger.info(
-                "[generate_memory] context fetched in %.3fs, overview='%s...', abstracts=%s",
+                "[generate_memory] context fetched in %.3fs, overview='%s...', abstracts=%s active_messages=%s",
                 time.monotonic() - ctx_start,
                 overview,
                 abstracts_count,
+                len(active_msgs),
             )
         except Exception as e:
             logger.warning(
@@ -153,9 +155,54 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 e,
             )
 
-        memory_text = ""
+        # 3. Assemble session history from OV context
+        session_history = ""
+        if context:
+            latest_overview = context.get("latest_archive_overview", "")
+            pre_archive_abstracts = context.get("pre_archive_abstracts", [])
+            active_messages = context.get("messages", [])
 
-        # 3-4. Search and assemble memories (if auto_recall enabled)
+            # Exclude the last active message if it matches the current turn
+            # (already captured to OV and will be sent by Higo as currentUser)
+            if active_messages:
+                active_messages = active_messages[:-1]
+                logger.info(
+                    "[generate_memory] excluded last active message, remaining=%s",
+                    len(active_messages),
+                )
+
+            # Compute history budget
+            history_budget = 0
+            if model_context_tokens > 0:
+                messages_tokens = sum(
+                    len(m.get("content", "")) // 4 for m in messages
+                )
+                reserved = 2048
+                available = model_context_tokens - messages_tokens - reserved
+                history_budget = max(0, int(available * 0.85))
+                logger.info(
+                    "[generate_memory] history_budget: model=%s messages=%s reserved=%s available=%s history=%s",
+                    model_context_tokens,
+                    messages_tokens,
+                    reserved,
+                    available,
+                    history_budget,
+                )
+
+            session_history = self._assemble_session_history(
+                latest_overview,
+                pre_archive_abstracts,
+                active_messages,
+                history_budget,
+            )
+            if session_history:
+                logger.info(
+                    "[generate_memory] session_history assembled, length=%s",
+                    len(session_history),
+                )
+
+        # 4-5. Search and assemble memories (if auto_recall enabled)
+        memory_text = ""
         if self.config.auto_recall:
             recall_start = time.monotonic()
             raw_query = extract_latest_user_text(messages)
@@ -170,7 +217,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
                     len(memories),
                 )
 
-                # 4. Assemble memory text
+                # 5. Assemble memory text
                 effective_budget = self.config.recall_token_budget
                 if model_context_tokens > 0:
                     messages_tokens = sum(
@@ -188,13 +235,22 @@ class OpenVikingMemoryEngine(MemoryEngine):
                         effective_budget,
                     )
 
-                memory_text = self._assemble_memory_text(memories, effective_budget)
+                memory_text = self._assemble_memory_text(
+                    memories, effective_budget, session_history=session_history
+                )
                 logger.info(
                     "[generate_memory] assembled memory_text length=%s",
                     len(memory_text) if memory_text else 0,
                 )
             else:
                 logger.info("[generate_memory] recall query empty, skipping")
+        elif session_history:
+            # Even without auto_recall, inject session history if available
+            memory_text = session_history
+            logger.info(
+                "[generate_memory] auto_recall disabled, using session_history only, length=%s",
+                len(memory_text),
+            )
         else:
             logger.info("[generate_memory] auto_recall disabled, skipping recall")
 
@@ -386,22 +442,114 @@ class OpenVikingMemoryEngine(MemoryEngine):
             logger.warning("[safe_find] error for %s: %s", target_uri or "(global)", e)
             return {}
 
-    def _assemble_memory_text(
-        self, memories: list[dict], token_budget: int
+    @staticmethod
+    def _extract_message_text(msg: dict) -> str:
+        """Extract text content from an OpenViking message dict."""
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        parts = msg.get("parts", [])
+        texts: list[str] = []
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if text:
+                    texts.append(text)
+        return "\n".join(texts) if texts else ""
+
+    def _assemble_session_history(
+        self,
+        latest_overview: str,
+        pre_archive_abstracts: list[str],
+        active_messages: list[dict],
+        history_budget: int,
     ) -> str:
-        """Assemble the memory text block for Higo injection."""
-        if not memories:
+        """Assemble and truncate session history text from OV context.
+
+        Truncation walks from newest to oldest to preserve recent context,
+        then outputs in chronological order (oldest -> newest).
+        """
+        if history_budget <= 0:
             return ""
 
-        lines = ["<relevant-memories>"]
-        memory_lines = build_memory_lines_with_budget(memories, token_budget)
-        lines.extend(memory_lines)
-        lines.append("</relevant-memories>")
+        def _estimate(text: str) -> int:
+            return max(1, len(text) // 4)
 
-        text = "\n".join(lines)
+        # Build formatted entries in chronological order (old -> new)
+        all_entries: list[tuple[str, int]] = []
+
+        # Pre-archive abstracts (oldest -> newest, as provided by OV)
+        for abstract in pre_archive_abstracts:
+            if not abstract or not abstract.strip():
+                continue
+            text = abstract.strip()[:800]
+            fmt = f"[归档摘要]\n{text}"
+            all_entries.append((fmt, _estimate(fmt)))
+
+        # Latest overview
+        if latest_overview and latest_overview.strip():
+            text = latest_overview.strip()[:800]
+            fmt = f"[最近归档摘要]\n{text}"
+            all_entries.append((fmt, _estimate(fmt)))
+
+        # Active messages (oldest -> newest, as provided by OV)
+        for msg in active_messages:
+            role = msg.get("role", "unknown")
+            content = self._extract_message_text(msg)
+            if not content:
+                continue
+            content = content[:500]
+            fmt = f"- {role}: {content}"
+            all_entries.append((fmt, _estimate(fmt)))
+
+        if not all_entries:
+            return ""
+
+        # Select from newest to oldest (preserve recent context)
+        total = 0
+        selected: list[str] = []
+        for fmt, est in reversed(all_entries):
+            if total + est > history_budget:
+                break
+            selected.insert(0, fmt)
+            total += est
+
+        if not selected:
+            return ""
+
+        lines = ["<session-history>"]
+        lines.extend(selected)
+        lines.append("</session-history>")
+        return "\n".join(lines)
+
+    def _assemble_memory_text(
+        self,
+        memories: list[dict],
+        token_budget: int,
+        session_history: str = "",
+    ) -> str:
+        """Assemble the memory text block for Higo injection."""
+        parts: list[str] = []
+
+        if session_history:
+            parts.append(session_history)
+
+        if memories:
+            lines = ["<relevant-memories>"]
+            memory_lines = build_memory_lines_with_budget(memories, token_budget)
+            lines.extend(memory_lines)
+            lines.append("</relevant-memories>")
+            parts.append("\n".join(lines))
+
+        if not parts:
+            return ""
+
+        text = "\n\n".join(parts)
         logger.info(
-            "[assemble] memories=%s text_len=%s",
+            "[assemble] memories=%s session_history=%s text_len=%s",
             len(memories),
+            bool(session_history),
             len(text),
         )
         return text
