@@ -16,6 +16,7 @@ class OpenVikingConfig(BaseModel):
     api_key: str = Field(default="")
     agent_id: str = Field(default="default")
     account_registry_path: str = Field(default=".account_registry.json")
+    user_id: str = Field(default="default")
     timeout_ms: int = Field(default=30000)
     commit_token_threshold: int = Field(default=8000)
     recall_limit: int = Field(default=10)
@@ -52,6 +53,7 @@ class OpenVikingConfig(BaseModel):
             account_registry_path=os.getenv(
                 "OPENVIKING_ACCOUNT_REGISTRY_PATH", ".account_registry.json"
             ),
+            user_id=os.getenv("OPENVIKING_USER_ID", "default"),
             timeout_ms=int(os.getenv("OPENVIKING_TIMEOUT_MS", "30000")),
             commit_token_threshold=int(
                 os.getenv("OPENVIKING_COMMIT_TOKEN_THRESHOLD", "8000")

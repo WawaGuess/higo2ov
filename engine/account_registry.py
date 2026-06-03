@@ -88,6 +88,7 @@ class AccountRegistry:
             base_url=self._admin.config.base_url,
             api_key=entry["api_key"],
             agent_id=self._admin.config.agent_id,
+            user_id=entry["user_id"],
         )
         client = OpenVikingClient(config)
         self._cache[higo_user_id] = client
@@ -113,7 +114,7 @@ class AccountRegistry:
                         "method": "POST",
                         "body": {
                             "account_id": account_id,
-                            "admin_user_id": "default",
+                            "admin_user_id": self._admin.config.user_id,
                         },
                     },
                 )
@@ -128,29 +129,30 @@ class AccountRegistry:
                     f"/api/v1/admin/accounts/{account_id}/users",
                     {
                         "method": "POST",
-                        "body": {"user_id": "default", "role": "user"},
+                        "body": {"user_id": self._admin.config.user_id, "role": "user"},
                     },
                 )
                 api_key = reg_resp["user_key"]
-                logger.info("[account_registry] registered user default for %s", account_id)
+                logger.info("[account_registry] registered user %s for %s", self._admin.config.user_id, account_id)
             except Exception as reg_err:
                 if "409" in str(reg_err) or "Conflict" in str(reg_err):
                     logger.warning(
-                        "[account_registry] user default already exists for %s (409), regenerating key",
+                        "[account_registry] user %s already exists for %s (409), regenerating key",
+                        self._admin.config.user_id,
                         account_id,
                     )
                     key_resp = await self._admin.request(
-                        f"/api/v1/admin/accounts/{account_id}/users/default/key",
+                        f"/api/v1/admin/accounts/{account_id}/users/{self._admin.config.user_id}/key",
                         {"method": "POST"},
                     )
                     api_key = key_resp["user_key"]
-                    logger.info("[account_registry] regenerated key for %s/default", account_id)
+                    logger.info("[account_registry] regenerated key for %s/%s", account_id, self._admin.config.user_id)
                 else:
                     raise
 
             entry = AccountEntry(
                 account_id=account_id,
-                user_id="default",
+                user_id=self._admin.config.user_id,
                 api_key=api_key,
                 created_at=datetime.now(timezone.utc).isoformat(),
             )

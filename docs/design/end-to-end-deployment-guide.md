@@ -107,10 +107,9 @@ python-dotenv
 ```bash
 # ─── OpenViking 连接配置 ───
 OPENVIKING_BASE_URL=http://127.0.0.1:1933
-OPENVIKING_API_KEY=your-api-key-if-needed
+OPENVIKING_ROOT_API_KEY=your-root-api-key
 OPENVIKING_AGENT_ID=default
-OPENVIKING_ACCOUNT_ID=your-account-id
-OPENVIKING_USER_ID=your-user-id
+OPENVIKING_USER_ID=default
 
 # ─── HTTP 超时 ───
 OPENVIKING_TIMEOUT_MS=30000
@@ -148,10 +147,10 @@ OPENVIKING_EMIT_DIAGNOSTICS=true
 | 环境变量 | 必填 | 默认值 | 说明 |
 |----------|------|--------|------|
 | `OPENVIKING_BASE_URL` | 是 | `http://127.0.0.1:1933` | OpenViking 服务地址 |
-| `OPENVIKING_API_KEY` | 否 | `""` | API 认证密钥（如 OpenViking 未启用认证可留空） |
+| `OPENVIKING_ROOT_API_KEY` | 否 | `""` | ROOT API Key，仅用于 admin 操作（创建 account、注册用户） |
 | `OPENVIKING_AGENT_ID` | 否 | `default` | 默认 Agent ID，用于 OpenViking 多租户路由 |
-| `OPENVIKING_ACCOUNT_ID` | 否 | `""` | 账户 ID，传递给 OpenViking 的 `X-OpenViking-Account` 头 |
-| `OPENVIKING_USER_ID` | 否 | `""` | 用户 ID，传递给 OpenViking 的 `X-OpenViking-User` 头 |
+| `OPENVIKING_USER_ID` | 否 | `default` | account 下默认用户的 user_id，懒创建 account 时使用 |
+| `OPENVIKING_ACCOUNT_REGISTRY_PATH` | 否 | `.account_registry.json` | 账户注册表本地持久化路径 |
 | `OPENVIKING_TIMEOUT_MS` | 否 | `30000` | 调用 OpenViking API 的超时时间（毫秒）。**注意**：Higo 对 higo2ov 的 transform 超时是 10000ms，建议此值小于 10000ms 以留出处理余量 |
 | `OPENVIKING_COMMIT_TOKEN_THRESHOLD` | 否 | `8000` | **自动归档触发阈值**。当 session 的 `pending_tokens` 超过此值时，自动触发 commit |
 | `OPENVIKING_RECALL_LIMIT` | 否 | `10` | 每次召回返回的最大记忆条数 |
@@ -476,7 +475,7 @@ VITE_SESSION_MEMORY_ENGINE_SETTINGS_ENABLED=true
 **排查步骤**:
 1. 确认 OpenViking 已启动：`curl http://<openviking-host>:1933/health`
 2. 检查 `.env` 中的 `OPENVIKING_BASE_URL` 是否正确
-3. 如果 OpenViking 需要认证，确认 `OPENVIKING_API_KEY` 已配置
+3. 如果 OpenViking 需要认证，确认 `OPENVIKING_ROOT_API_KEY` 已配置
 4. 检查网络连通性：从 higo2ov 所在机器执行 `curl http://<openviking-host>:1933/health`
 
 ### 7.4 Higo 报 `SESSION_MEMORY_ENGINE_INVALID_RESPONSE`

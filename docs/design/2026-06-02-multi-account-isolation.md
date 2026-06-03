@@ -133,6 +133,7 @@ class AccountRegistry:
                 base_url=self._admin.config.base_url,
                 api_key=entry["api_key"],
                 agent_id=self._admin.config.agent_id,
+                user_id=entry["user_id"],
             )
         )
         self._cache[higo_user_id] = client
@@ -155,7 +156,7 @@ class AccountRegistry:
                     "/api/v1/admin/accounts",
                     {"method": "POST", "body": {
                         "account_id": account_id,
-                        "admin_user_id": "default",
+                        "admin_user_id": self._admin.config.user_id,
                     }},
                 )
 
@@ -163,13 +164,13 @@ class AccountRegistry:
             try:
                 reg_resp = await self._admin.request(
                     f"/api/v1/admin/accounts/{account_id}/users",
-                    {"method": "POST", "body": {"user_id": "default", "role": "user"}},
+                    {"method": "POST", "body": {"user_id": self._admin.config.user_id, "role": "user"}},
                 )
                 api_key = reg_resp["user_key"]
             except Exception as e:
                 if "409" in str(e) or "Conflict" in str(e):
                     key_resp = await self._admin.request(
-                        f"/api/v1/admin/accounts/{account_id}/users/default/key",
+                        f"/api/v1/admin/accounts/{account_id}/users/{self._admin.config.user_id}/key",
                         {"method": "POST"},
                     )
                     api_key = key_resp["user_key"]
@@ -178,7 +179,7 @@ class AccountRegistry:
 
             entry = AccountEntry(
                 account_id=account_id,
-                user_id="default",
+                user_id=self._admin.config.user_id,
                 api_key=api_key,
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
@@ -225,15 +226,16 @@ OPENVIKING_USER_ID=default
 OPENVIKING_ROOT_API_KEY=ov-root-...           # ROOT key，仅用于 admin
 OPENVIKING_AGENT_ID=higo-extension
 OPENVIKING_ACCOUNT_REGISTRY_PATH=.account_registry.json
+OPENVIKING_USER_ID=default                   # account 下默认用户的 user_id
 
-# 删除以下两项（不再使用固定 account）
+# 删除以下一项（不再使用固定 account）
 # OPENVIKING_ACCOUNT_ID=default
-# OPENVIKING_USER_ID=default
 ```
 
 `config.py` 变更：
 - 环境变量 `OPENVIKING_API_KEY` 重命名为 `OPENVIKING_ROOT_API_KEY`，模型字段仍保持 `api_key`（兼容 `OpenVikingClient`）
-- 删除 `account_id`、`user_id` 硬编码配置
+- 删除 `account_id` 硬编码配置
+- `user_id` 改为从环境变量 `OPENVIKING_USER_ID` 读取（默认 `default`），用于 account 下默认用户
 - 新增 `account_registry_path`
 
 ## 请求流程（完整链路）
@@ -253,7 +255,7 @@ account_registry.get_client("higo_abc")
     - 查 registry：无
     - 懒创建：
         admin_client POST /admin/accounts  (account_id=higo_abc)
-        admin_client POST /admin/accounts/higo_abc/users  (user_id=default)
+        admin_client POST /admin/accounts/higo_abc/users  (user_id=config.user_id)
         返回 USER key: "xxx.xxx.xxx"
         保存到 .account_registry.json
     - new OpenVikingClient(api_key=USER key)
@@ -282,7 +284,7 @@ user_client POST /api/v1/sessions/{id}/commit        (account=higo_abc)
 
 ## 实施顺序
 
-1. **配置层**：`.env` + `config.py`（改 `OPENVIKING_ROOT_API_KEY`，删 `ACCOUNT_ID`/`USER_ID`，加 `ACCOUNT_REGISTRY_PATH`）
+1. **配置层**：`.env` + `config.py`（改 `OPENVIKING_ROOT_API_KEY`，删 `ACCOUNT_ID`，保留 `USER_ID` 为可配置，加 `ACCOUNT_REGISTRY_PATH`）
 2. **AccountRegistry 模块**：新建 `engine/account_registry.py`
 3. **Client 层**：`engine/openviking_client.py`（`_request` 改为 public，或新增 `request` 方法）
 4. **Engine 层**：`engine/openviking_engine.py`（引入 AccountRegistry，替换 `self.client` 为按需 resolve）
@@ -295,4 +297,4 @@ user_client POST /api/v1/sessions/{id}/commit        (account=higo_abc)
 2. 重复请求（同一用户）：验证命中缓存，未重复调 admin API
 3. Registry 丢失后重启：验证能自动恢复（通过 `regenerate_key`）
 4. 不带 userId 的请求：验证 fallback 到 ROOT client，数据落到 `default` account
-5. Commit 后：验证 memories 提取到 `data/viking/higo_xxx/user/default/memories/`
+5. Commit 后：验证 memories 提取到 `data/viking/higo_xxx/user/{config.user_id}/memories/`

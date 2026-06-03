@@ -169,12 +169,14 @@ class MemoryQueryResponse(BaseModel):
 
 ```python
 self.config = config                    # OpenVikingConfig
-self.client = client                    # OpenVikingClient
+self.account_registry = account_registry  # AccountRegistry（多账户隔离）
 self._agent_resolver = AgentResolver(config.agent_id)
 self._bypass_patterns = compile_session_patterns(
     [p.strip() for p in config.bypass_session_patterns.split(",") if p.strip()]
 )
 ```
+
+> 注：多账户隔离实施后，引擎不再持有单一的 `self.client`，而是通过 `AccountRegistry` 按需 `resolve` 用户对应的 USER key client。`AccountRegistry` 负责懒创建 OpenViking account、注册 user、管理 USER key 的本地持久化与缓存。
 
 ### 4.2 主入口 `generate_memory()`
 
@@ -196,6 +198,7 @@ Step 5: Async commit（异步提交）
   - 非 UUID → `sha256(session_id).hexdigest`
 - 检查 `should_bypass_session(session_id, self._bypass_patterns)`
   - 若匹配 bypass 模式 → 直接返回空字符串（跳过所有处理）
+- 通过 `self.account_registry.get_client(user_id)` 解析该用户对应的 USER key client（首次使用会懒创建 account 和 USER key）
 
 #### Step 1: Capture Messages（`_capture_messages`）
 
@@ -489,11 +492,12 @@ openviking: diag {"ts": 1716633600000, "stage": "...", "sessionId": "...", "data
 ### 9.1 认证与路由头
 
 ```
-X-API-Key          ← config.api_key
-X-OpenViking-Account ← config.account_id
-X-OpenViking-User  ← config.user_id
-X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
+X-API-Key            ← config.api_key（USER key 自带 account_id 和 user_id）
+X-OpenViking-User    ← config.user_id（用于 ROOT key 场景；USER key 自带 user_id）
+X-OpenViking-Agent   ← config.agent_id（或被调用方覆盖）
 ```
+
+> **多账户隔离下的变化**：业务请求使用 USER key（由 `AccountRegistry` 懒创建），USER key 的 base64 载荷中已包含 `account_id` 和 `user_id`，因此请求时**不需要**再传 `X-OpenViking-Account`。`X-OpenViking-User` 仅在 ROOT key 场景下生效（如 `AccountRegistry` 的 admin client）。`OpenVikingClient` 的所有 API 方法不再接受 `user_id` 参数，`user_id` 统一从 `config.user_id` 读取。
 
 ### 9.2 核心 API 方法
 
@@ -528,10 +532,10 @@ X-OpenViking-Agent ← config.agent_id (或被调用方覆盖)
 | 环境变量 | 默认值 | 类型 | 说明 |
 |---------|--------|------|------|
 | `OPENVIKING_BASE_URL` | `http://127.0.0.1:1933` | str | OpenViking 服务地址 |
-| `OPENVIKING_API_KEY` | `""` | str | API Key |
+| `OPENVIKING_ROOT_API_KEY` | `""` | str | ROOT API Key，仅用于 admin 操作（创建 account、注册用户） |
 | `OPENVIKING_AGENT_ID` | `default` | str | 默认 Agent ID |
-| `OPENVIKING_ACCOUNT_ID` | `""` | str | 账户 ID |
-| `OPENVIKING_USER_ID` | `""` | str | 用户 ID |
+| `OPENVIKING_USER_ID` | `default` | str | account 下默认用户的 user_id，用于注册 account 用户和 USER key 生成 |
+| `OPENVIKING_ACCOUNT_REGISTRY_PATH` | `.account_registry.json` | str | 账户注册表本地持久化路径 |
 | `OPENVIKING_TIMEOUT_MS` | `30000` | int | HTTP 请求超时（毫秒） |
 | `OPENVIKING_COMMIT_TOKEN_THRESHOLD` | `8000` | int | 自动提交 token 阈值 |
 | `OPENVIKING_RECALL_LIMIT` | `10` | int | 单次搜索返回数量上限（搜索层） |

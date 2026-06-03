@@ -137,7 +137,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         ctx_start = time.monotonic()
         context = {}
         try:
-            context = await client.get_session_context(ov_session_id, user_id=user_id)
+            context = await client.get_session_context(ov_session_id)
             overview = context.get("latest_archive_overview", "")[:50]
             abstracts_count = len(context.get("pre_archive_abstracts", []))
             logger.info(
@@ -289,7 +289,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
                             role_id="user",
                             parts=parts,
                             created_at=datetime.now(timezone.utc).isoformat(),
-                            user_id=user_id,
+                            
                         )
                         captured += 1
                         logger.info(
@@ -373,7 +373,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         client = await self._resolve_client(user_id)
         try:
             result = await client.find(
-                query, target_uri, limit, score_threshold, agent_id, mode, user_id
+                query, target_uri, limit, score_threshold, agent_id, mode
             )
             memories = result.get("memories", [])
             logger.info(
@@ -410,7 +410,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         """Trigger commit if pending_tokens exceeds threshold."""
         client = await self._resolve_client(user_id)
         try:
-            session_info = await client.get_session(ov_session_id, user_id=user_id)
+            session_info = await client.get_session(ov_session_id)
             pending_tokens = session_info.get("pending_tokens", 0)
             logger.info(
                 "[commit_check] ovSessionId=%s userId=%s pending_tokens=%s threshold=%s",
@@ -428,7 +428,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
                     self.config.commit_token_threshold,
                 )
                 commit_result = await client.commit_session(
-                    ov_session_id, wait=False, user_id=user_id
+                    ov_session_id, wait=False, 
                 )
                 logger.info(
                     "[commit] triggered for ovSessionId=%s status=%s archived=%s task_id=%s",
@@ -509,7 +509,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
         # Pre-commit token estimate
         tokens_before: int | None = None
         try:
-            pre_ctx = await client.get_session_context(ov_session_id, user_id=user_id)
+            pre_ctx = await client.get_session_context(ov_session_id)
             estimated = pre_ctx.get("estimatedTokens")
             if isinstance(estimated, (int, float)) and estimated > 0:
                 tokens_before = int(estimated)
@@ -527,7 +527,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
                 user_id or "(default)",
             )
             commit_result = await client.commit_session(
-                ov_session_id, wait=True, user_id=user_id
+                ov_session_id, wait=True, 
             )
 
             mem_count = 0
@@ -617,7 +617,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             first_kept_entry_id = ""
 
             try:
-                post_ctx = await client.get_session_context(ov_session_id, user_id=user_id)
+                post_ctx = await client.get_session_context(ov_session_id)
                 overview = post_ctx.get("latest_archive_overview", "")
                 if isinstance(overview, str):
                     summary = overview.strip()
@@ -730,7 +730,6 @@ class OpenVikingMemoryEngine(MemoryEngine):
                         role_id="assistant",
                         parts=[{"type": "text", "text": text}],
                         created_at=datetime.now(timezone.utc).isoformat(),
-                        user_id=user_id,
                     )
                     captured += 1
                     logger.info(
@@ -759,7 +758,6 @@ class OpenVikingMemoryEngine(MemoryEngine):
                         role_id="user",
                         parts=parts,
                         created_at=datetime.now(timezone.utc).isoformat(),
-                        user_id=user_id,
                     )
                     captured += 1
                     logger.info(
