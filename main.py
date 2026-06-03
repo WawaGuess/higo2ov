@@ -210,6 +210,18 @@ async def _handle_transform(
 
     # Record turn data for monitoring (after message reconstruction)
     from monitor.collector import TurnCollector
+
+    # Identify contextEnv from original messages (first user that is not last)
+    last_user_idx = -1
+    for i, msg in enumerate(original_messages):
+        if msg.role == "user":
+            last_user_idx = i
+    context_env_text = ""
+    for i, msg in enumerate(original_messages):
+        if msg.role == "user" and i < last_user_idx:
+            context_env_text = msg.content
+            break
+
     TurnCollector.get_instance().start_turn(
         session_id=sid,
         round_id=request.round.roundId if request.round else f"unknown_{time.time()}",
@@ -217,6 +229,7 @@ async def _handle_transform(
         messages=[m.model_dump() for m in new_messages],
         model_tokens=model_tokens,
         memory_text=memory_text,
+        context_env_text=context_env_text,
     )
 
     return TransformResponse(

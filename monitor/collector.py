@@ -53,14 +53,19 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
-def _chunk_input(messages: list[dict], memory_text: str = "") -> tuple[list[dict], int]:
+def _chunk_input(
+    messages: list[dict],
+    memory_text: str = "",
+    context_env_text: str = "",
+) -> tuple[list[dict], int]:
     """Break reconstructed messages into categorized chunks with token counts.
 
     Categories:
-        system  → role="system"
-        memory  → role="user" and content matches memory_text
-        history → other user/assistant/tool messages
-        user    → last role="user" (the current query, excluding memory)
+        system      → role="system"
+        memory      → role="user" and content matches <relevant-memories>
+        context_env → role="user" and content matches contextEnv
+        history     → other user/assistant/tool messages (incl. <session-history>)
+        user        → last role="user" (the current query, excluding memory)
     """
     chunks: list[dict] = []
     total = 0
@@ -73,6 +78,7 @@ def _chunk_input(messages: list[dict], memory_text: str = "") -> tuple[list[dict
 
     system_content = ""
     memory_content = ""
+    context_env_content = ""
     user_content = ""
     history_parts: list[str] = []
 
@@ -85,7 +91,20 @@ def _chunk_input(messages: list[dict], memory_text: str = "") -> tuple[list[dict
         elif role == "user":
             # Check if this is the injected memory message
             if memory_text and memory_text in content:
-                memory_content = content
+                # Split <session-history> from <relevant-memories>
+                session_history_text = ""
+                memory_only_text = content
+                if "<session-history>" in content and "</session-history>" in content:
+                    start = content.find("<session-history>")
+                    end = content.find("</session-history>") + len("</session-history>")
+                    session_history_text = content[start:end]
+                    memory_only_text = (content[:start] + content[end:]).strip()
+
+                memory_content = memory_only_text
+                if session_history_text:
+                    history_parts.append(f"[Session History]\n{session_history_text}")
+            elif context_env_text and context_env_text in content:
+                context_env_content = content
             elif i == last_user_idx:
                 user_content = content
             else:
@@ -108,7 +127,7 @@ def _chunk_input(messages: list[dict], memory_text: str = "") -> tuple[list[dict
             "content_preview": system_content[:200],
         })
 
-    # Injected Memory chunk
+    # Injected Memory chunk (<relevant-memories> only)
     if memory_content:
         tokens = _count_tokens(memory_content) + 3
         total += tokens
@@ -119,7 +138,18 @@ def _chunk_input(messages: list[dict], memory_text: str = "") -> tuple[list[dict
             "content_preview": memory_content[:200],
         })
 
-    # Conversation History chunk
+    # Context Environment chunk
+    if context_env_content:
+        tokens = _count_tokens(context_env_content) + 3
+        total += tokens
+        chunks.append({
+            "name": "Context Environment",
+            "category": "context_env",
+            "tokens": tokens,
+            "content_preview": context_env_content[:200],
+        })
+
+    # Conversation History chunk (includes <session-history>)
     if history_parts:
         history_text = "\n\n".join(history_parts)
         tokens = sum(_count_tokens(part) + 3 for part in history_parts)
@@ -287,10 +317,11 @@ class TurnCollector:
         messages: list[dict],
         model_tokens: int = 0,
         memory_text: str = "",
+        context_env_text: str = "",
     ) -> None:
         """Called AFTER _build_messages(), with the reconstructed message list."""
 
-        chunks, input_tokens = _chunk_input(messages, memory_text)
+        chunks, input_tokens = _chunk_input(messages, memory_text, context_env_text)
 
         system_tokens = sum(c["tokens"] for c in chunks if c["category"] == "system")
         user_tokens = sum(c["tokens"] for c in chunks if c["category"] == "user")
@@ -316,7 +347,14 @@ class TurnCollector:
                 system_prompt = content
             elif role == "user":
                 if memory_text and memory_text in content:
+                    # Store only <relevant-memories> part
                     memory_injected = content
+                    if "<session-history>" in content and "</session-history>" in content:
+                        start = content.find("<session-history>")
+                        end = content.find("</session-history>") + len("</session-history>")
+                        memory_injected = (content[:start] + content[end:]).strip()
+                elif context_env_text and context_env_text in content:
+                    pass  # contextEnv handled separately in chunks
                 elif i == last_user_idx:
                     user_input = content
                 else:
