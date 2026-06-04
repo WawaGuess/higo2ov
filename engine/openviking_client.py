@@ -1,3 +1,6 @@
+# 相关文档:
+#   - docs/engine/客户端.md
+#   - docs/架构总览.md
 """OpenViking HTTP API client."""
 
 import asyncio

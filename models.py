@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/协议说明.md（请求/响应模型）
 from typing import Literal, Any
 from pydantic import BaseModel, Field
 

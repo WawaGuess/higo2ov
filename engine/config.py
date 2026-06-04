@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/engine/配置说明.md
 """OpenViking configuration loaded from .env file."""
 
 import os

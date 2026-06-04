@@ -1,3 +1,10 @@
+# 相关文档:
+#   - docs/架构总览.md（主流程）
+#   - docs/features/消息捕获.md
+#   - docs/features/会话历史.md
+#   - docs/features/记忆召回.md
+#   - docs/features/记忆注入.md
+#   - docs/features/归档与压缩.md
 """OpenViking memory engine implementation."""
 
 import asyncio
@@ -22,6 +29,7 @@ from engine.text_utils import (
     prepare_recall_query,
     sanitize_user_text_for_capture,
 )
+from utils.token_utils import _count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +183,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             history_budget = 0
             if model_context_tokens > 0:
                 messages_tokens = sum(
-                    len(m.get("content", "")) // 4 for m in messages
+                    _count_tokens(m.get("content", "")) for m in messages
                 )
                 reserved = 2048
                 available = model_context_tokens - messages_tokens - reserved
@@ -474,7 +482,7 @@ class OpenVikingMemoryEngine(MemoryEngine):
             return ""
 
         def _estimate(text: str) -> int:
-            return max(1, len(text) // 4)
+            return max(1, _count_tokens(text))
 
         # Build formatted entries in chronological order (old -> new)
         all_entries: list[tuple[str, int]] = []

@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/engine/配置说明.md（Bypass 模式）
 """Session bypass pattern matching with glob-like syntax."""
 
 import re

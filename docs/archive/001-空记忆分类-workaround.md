@@ -1,5 +1,7 @@
 # Bug: OpenViking 搜索返回的 memory category 为空
 
+> **归档说明**：此问题已通过 higo2ov 侧的 workaround 修复（方案 A）。OpenViking 服务端根因未修复。本文档保留供回溯参考。
+
 ## 问题描述
 
 在 higo2ov 的 transform 流程中，`_recall_memories` 调用 OpenViking 的 `POST /api/v1/search/find` 接口搜索相关记忆。搜索结果中的 `category` 字段全部为 `""`（空字符串），导致拼接出的记忆文本显示为 `- [] content` 而非 `- [memory] content`。
@@ -82,9 +84,9 @@ results.append(
 
 ---
 
-## 解决方案
+## 解决方案（已实施）
 
-### 方案 A：在 higo2ov 侧修复（推荐，立即可用）
+### 方案 A：在 higo2ov 侧修复（workaround）
 
 在 `engine/memory_ranking.py` 的 `build_memory_lines_with_budget` 中，从 URI 路径推导 category：
 
@@ -108,84 +110,15 @@ def _derive_category_from_uri(uri: str) -> str:
 category = r.get("category") or _derive_category_from_uri(r.get("uri", ""))
 ```
 
-**优点：**
-- 不需要修改 OpenViking 服务端
-- 不需要重新编译/重新索引
-- 改一行代码即可生效
-
-**缺点：**
-- 是 workaround，非根治
-- 如果 OpenViking 未来修改了目录结构，需要同步更新推导逻辑
-
----
-
-### 方案 B：在 OpenViking 服务端修复（根治）
-
-#### B1. 轻量版（Python 检索层）
-
-在 `openviking/retrieve/hierarchical_retriever.py:565` 处，如果 `category` 为空则从 URI 推导：
-
-```python
-def _derive_category_from_uri(uri: str) -> str:
-    if "/preferences" in uri:
-        return "preferences"
-    if "/entities" in uri:
-        return "entities"
-    if "/events" in uri:
-        return "events"
-    if "/profile" in uri:
-        return "profile"
-    if "/patterns" in uri:
-        return "patterns"
-    if "/cases" in uri:
-        return "cases"
-    return ""
-
-# 修改构造逻辑
-category = c.get("category", "") or _derive_category_from_uri(c.get("uri", ""))
-```
-
-**复杂度：** 极低，改一行代码 + 加一个函数。
-
-**优点：**
-- 所有调用方（包括 higo2ov、CLI、其他插件）自动受益
-- 不需要改存储层
-
-**缺点：**
-- 每次搜索都要做 URI 字符串匹配，有微小性能开销
-
-#### B2. 根治版（存储层）
-
-在 OpenViking 存储层写入文档时，将 `category` 字段写入索引元数据。具体位置取决于存储层实现（可能涉及 `crates/ragfs` 或 `src/` 下的 Rust/C++ 代码）。
-
-**复杂度：** 高。需要：
-1. 定位存储层写入元数据的代码
-2. 修改数据结构/schema
-3. 对已有数据可能需要重新索引
-4. 编译 Rust/C++ 扩展
-
-**优点：**
-- 彻底解决问题
-- 搜索返回的元数据完整
-
-**缺点：**
-- 需要熟悉 OpenViking 的 Rust/C++ 存储层代码
-- 可能涉及数据迁移
-
----
-
-## 决策建议
-
-| 方案 | 工作量 | 影响面 | 推荐度 |
-|------|--------|--------|--------|
-| A（higo2ov workaround） | 5 分钟 | 仅 higo2ov | ⭐⭐⭐⭐⭐ 立即可用 |
-| B1（OpenViking Python 层） | 10 分钟 | 所有 OpenViking 客户端 | ⭐⭐⭐⭐ 长期更优 |
-| B2（OpenViking 存储层） | 数小时~天 | 所有 OpenViking 客户端 | ⭐⭐⭐ 最彻底但成本高 |
-
----
-
-## 后续更新
-
 **2026-05-28：** higo2ov 侧已实施方案 A，在 `engine/memory_ranking.py` 中新增 `_derive_category_from_uri()` 函数，从 URI 路径推导 category。当前注入记忆文本中 category 标签显示正常。
 
 > 注：此为 higo2ov 侧的 workaround，OpenViking 服务端返回的 `category` 字段仍为空字符串，未从根因修复。
+
+---
+
+## 相关代码
+
+| 逻辑 | 文件 | 函数/类 |
+|------|------|---------|
+| Category 推导 workaround | `engine/memory_ranking.py` | `_derive_category_from_uri()` |
+| 记忆行组装 | `engine/memory_ranking.py` | `build_memory_lines_with_budget()` |

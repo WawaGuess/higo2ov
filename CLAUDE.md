@@ -1,57 +1,57 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Claude Code (claude.ai/code) 提供本仓库的代码协作指引。
 
-## Project Overview
+## 项目概述
 
-This is a **Higo Session Memory Plugin** — a FastAPI service that intercepts conversation messages and injects a generated memory summary before the current user message. It implements the **Higo V2 plugin protocol** with three modes: `probe` (health check), `transform` (message modification), and `result` (round result callback).
+本项目是 **Higo Session Memory Plugin** —— 一个 FastAPI 服务，用于拦截会话消息并在当前用户消息前注入一段由记忆引擎生成的摘要。它实现了 **Higo V2 插件协议**，包含四种模式：`probe`（健康检查）、`transform`（消息改写）、`result`（轮次结果回调）和 `memory_query`（记忆查询）。
 
-## Development Commands
+## 开发命令
 
 ```bash
-# Install dependencies
+# 安装依赖
 pip install -r requirements.txt
 
-# Run the development server (auto-reload on port 8000)
+# 启动开发服务器（端口 8000，自动重载）
 python main.py
 
-# Or run directly with uvicorn
+# 或直接用 uvicorn 启动
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-There is no test suite, linting config, or build tool configured in this repo.
+本仓库未配置测试套件、lint 规则或构建工具。
 
-## Architecture
+## 架构
 
-### Request Flow
+### 请求流转
 
-1. **Entry point**: `main.py` exposes a single `POST /` endpoint that routes requests by `mode`.
-2. **Models**: `models.py` defines Pydantic v2 models for the Higo V2 plugin protocol (`ProbeRequest`, `TransformRequest`, `ResultRequest`, and corresponding responses).
-3. **Memory Engine**: `engine/openviking_engine.py` implements `OpenVikingMemoryEngine`. The engine's `generate_memory(session_id, messages)` async method produces the memory text injected into the conversation.
+1. **入口**：`main.py` 暴露唯一的 `POST /` 端点，根据 `mode` 字段路由请求。
+2. **模型**：`models.py` 定义了 Higo V2 插件协议的 Pydantic v2 模型（`ProbeRequest`、`TransformRequest`、`ResultRequest` 及对应的响应模型）。
+3. **记忆引擎**：`engine/openviking_engine.py` 实现了 `OpenVikingMemoryEngine`。引擎的 `generate_memory(session_id, messages)` 异步方法生成被注入会话的记忆文本。
 
-### Message Reconstruction (`_build_messages` in `main.py`)
+### 消息重建（`main.py` 中的 `_build_messages`）
 
-The transform endpoint rebuilds the message list according to the V2 protocol. The output order is:
+Transform 端点按照 V2 协议重建消息列表，输出顺序为：
 
-1. `system` message (preserved from original)
-2. `user` — injected memory message (from engine)
-3. `user` — context/environment info (preserved from original)
-4. `user` — current user message (always last)
+1. `system` 消息（保留原始内容）
+2. `user` —— 注入的记忆消息（来自引擎）
+3. `user` —— 上下文/环境信息（保留原始内容）
+4. `user` —— 当前用户消息（始终在最后）
 
-When modifying `_build_messages`, maintain this ordering invariant — the Higo client depends on the final message being the current user input.
+修改 `_build_messages` 时，必须保持上述顺序不变 —— Higo 客户端依赖最后一条消息为当前用户输入。
 
-### V2 Protocol Fields
+### V2 协议字段
 
-**Transform request key fields:**
-- `session.sessionId` — session identifier
-- `round.roundId` / `round.seq` / `round.startedAt` — round info
-- `request.messages` — message list `[system, user(context), user(current)]`
-- `meta.modelContextWindowTokens` — model context window size
+**Transform 请求关键字段：**
+- `session.sessionId` —— 会话标识符
+- `round.roundId` / `round.seq` / `round.startedAt` —— 轮次信息
+- `request.messages` —— 消息列表 `[system, user(context), user(current)]`
+- `meta.modelContextWindowTokens` —— 模型上下文窗口大小
 
-**Transform response structure:**
-- `ok` — always `true`
-- `summary` — status description
-- `result.request.messages` — modified message list
-- `result.pluginContext` — optional plugin context (e.g. `memoryRevision`)
+**Transform 响应结构：**
+- `ok` —— 始终为 `true`
+- `summary` —— 状态描述
+- `result.request.messages` —— 修改后的消息列表
+- `result.pluginContext` —— 可选的插件上下文（例如 `memoryRevision`）
 
-Note: V2 protocol does not use `anchor`, top-level `sessionId`, or `debug` fields.
+注意：V2 协议不使用 `anchor`、顶层 `sessionId` 或 `debug` 字段。

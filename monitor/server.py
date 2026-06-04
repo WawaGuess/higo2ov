@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/监控与统计.md（Monitor 路由）
 """MonitorServer — FastAPI routes for the Higo2OV monitor dashboard."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# 相关文档:
+#   - docs/engine/文本处理.md
+#   - docs/features/消息捕获.md（捕获决策）
 """Text extraction, sanitization, capture decision, and message format conversion."""
 
 import re

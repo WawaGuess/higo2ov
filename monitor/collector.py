@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/监控与统计.md（TurnCollector 数据模型）
 """TurnCollector — aggregates per-turn conversation data for the monitor UI."""
 
 from __future__ import annotations
@@ -11,33 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.token_utils import _count_tokens
+
 logger = logging.getLogger(__name__)
 
 _MAX_TURNS_PER_SESSION = 50
-
-# ------------------------------------------------------------------
-# Token counting (tiktoken preferred, fallback to rough estimate)
-# ------------------------------------------------------------------
-try:
-    import tiktoken
-
-    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _TIKTOKEN_ENC = None
-
-
-def _count_tokens(text: str) -> int:
-    if not text:
-        return 0
-    if _TIKTOKEN_ENC is not None:
-        try:
-            return len(_TIKTOKEN_ENC.encode(text))
-        except Exception:
-            pass
-    total = 0
-    for ch in text:
-        total += 1 if ord(ch) > 127 else 0.25
-    return max(1, int(total))
 
 
 def _extract_text(content: Any) -> str:

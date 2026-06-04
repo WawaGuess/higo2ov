@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/engine/客户端.md（Agent 作用域）
 """Session-Agent resolver with caching and prefix support."""
 
 import re

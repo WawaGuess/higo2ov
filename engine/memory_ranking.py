@@ -1,8 +1,11 @@
+# 相关文档:
+#   - docs/engine/记忆排序.md
+#   - docs/features/记忆召回.md
 """Memory post-processing: deduplication, filtering, reranking, and budget management."""
 
 import re
 
-from monitor.collector import _count_tokens
+from utils.token_utils import _count_tokens
 
 
 # ------------------------------------------------------------------

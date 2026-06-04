@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/架构总览.md（Engine 模块导出）
 from .agent_resolver import AgentResolver
 from .bypass import compile_session_patterns, should_bypass_session
 from .config import OpenVikingConfig

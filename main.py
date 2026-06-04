@@ -1,3 +1,7 @@
+# 相关文档:
+#   - docs/协议说明.md（Higo V2 协议路由）
+#   - docs/features/记忆注入.md（消息重建顺序）
+#   - docs/监控与统计.md（Token 统计 API）
 import asyncio
 import json
 import logging

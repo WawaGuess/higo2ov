@@ -1,3 +1,6 @@
+# 相关文档:
+#   - docs/features/多租户隔离.md
+#   - docs/engine/账户注册表.md
 """Account registry with lazy creation and local persistence.
 
 Each Higo user gets their own OpenViking account + USER key.

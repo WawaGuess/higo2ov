@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/架构总览.md（MemoryEngine 接口）
 from abc import ABC, abstractmethod
 
 

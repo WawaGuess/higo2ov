@@ -11,3 +11,4 @@ venv/
 data/
 .account_registry.json
 /.codegraph/
+.DS_Store

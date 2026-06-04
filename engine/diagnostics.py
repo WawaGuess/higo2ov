@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/日志参考.md
 """Structured diagnostic logging utilities."""
 
 import json

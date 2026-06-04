@@ -1,3 +1,5 @@
+# 相关文档:
+#   - docs/协议说明.md（Session ID 映射）
 """Session identity mapping and agent resolution utilities."""
 
 import hashlib
