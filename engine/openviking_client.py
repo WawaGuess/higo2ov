@@ -30,8 +30,8 @@ DEFAULT_WAIT_REQUEST_TIMEOUT_MS = 120_000
 WAIT_REQUEST_TIMEOUT_BUFFER_MS = 5_000
 
 
-def _sleep(ms: int) -> None:
-    asyncio.sleep(ms / 1000)
+async def _sleep(ms: int) -> None:
+    await asyncio.sleep(ms / 1000)
 
 
 def is_memory_uri(uri: str) -> bool:

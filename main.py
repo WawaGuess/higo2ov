@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -277,7 +278,7 @@ async def _handle_result(request: ResultRequest) -> ResultResponse:
     # Async commit if threshold exceeded
     from engine.session_utils import session_to_ov_id
     ov_session_id = session_to_ov_id(session_id)
-    asyncio.get_event_loop().create_task(
+    asyncio.create_task(
         memory_engine._maybe_commit(ov_session_id, user_id=user_id)
     )
 
